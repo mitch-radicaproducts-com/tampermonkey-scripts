@@ -1,13 +1,20 @@
 // ==UserScript==
 // @name         Airtable Form - Autofocus Barcode Field
 // @namespace    radicaproducts.com
-// @version      1.0
-// @description  Waits for the "Scan the barcode on the Build Sheet" textarea to appear on an Airtable form and automatically focuses it, including after each submission.
+// @version      1.1.0
+// @description  Autofocuses the "Scan the barcode on the Build Sheet" textarea on an Airtable form, and makes Enter submit the form directly instead of adding a newline.
 // @author       Mitchell Sanchez
 // @match        https://airtable.com/*
 // @run-at       document-idle
 // @grant        none
+// @updateURL    https://raw.githubusercontent.com/RADICA-ORG/radica-userscripts/main/airtable-barcode-autofocus.user.js
+// @downloadURL  https://raw.githubusercontent.com/RADICA-ORG/radica-userscripts/main/airtable-barcode-autofocus.user.js
+// @supportURL   https://github.com/RADICA-ORG/radica-userscripts/issues
 // ==/UserScript==
+
+// NOTE: Replace RADICA-ORG/radica-userscripts above with your real GitHub
+// org/repo path before distributing. Bump @version on every change or
+// installed copies will not update.
 
 (function () {
     'use strict';
@@ -16,8 +23,9 @@
     // wording/capitalization changes in Airtable won't break it.
     const LABEL_TEXT = 'scan the barcode on the build sheet';
 
-    let lastFocused = null; // textarea we most recently focused
-    let pending = false; // debounce flag for observer bursts
+    let lastFocused = null;   // textarea we most recently focused
+    let pending = false;      // debounce flag for observer bursts
+    let submitting = false;   // guards against double-submits
 
     function normalize(s) {
         return (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
@@ -57,6 +65,54 @@
         }
 
         return null;
+    }
+
+    // Locate the form's submit button ("Create").
+    function findSubmitButton(fromEl) {
+        const form = fromEl && fromEl.closest ? fromEl.closest('form') : null;
+        const scope = form || document;
+
+        return scope.querySelector('button[type="submit"]:not([aria-disabled="true"])')
+            || scope.querySelector('button[aria-label="Create"]')
+            || scope.querySelector('button[type="submit"]');
+    }
+
+    // Enter in the barcode textarea submits the form instead of inserting a newline.
+    function handleEnter(e) {
+        if (e.key !== 'Enter' || e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return;
+        if (e.isComposing) return;
+
+        const ta = e.target;
+        if (!ta || ta.tagName !== 'TEXTAREA') return;
+        if (ta !== findBarcodeTextarea()) return;   // only our field
+
+        // Never let the newline reach the textarea.
+        e.preventDefault();
+        e.stopPropagation();
+
+        if (submitting) return;
+        if (!ta.value.trim()) return;   // don't submit an empty scan
+
+        submitting = true;
+
+        // Brief pause so Airtable's React state registers the scanned value
+        // before the click lands.
+        setTimeout(() => {
+            const btn = findSubmitButton(ta);
+            if (btn) {
+                btn.click();
+            } else {
+                const form = ta.closest('form');
+                if (form && form.requestSubmit) form.requestSubmit();
+            }
+
+            // Allow the next scan, and re-focus the fresh field.
+            setTimeout(() => {
+                submitting = false;
+                lastFocused = null;
+                tryFocus();
+            }, 600);
+        }, 60);
     }
 
     function isVisible(el) {
@@ -128,6 +184,9 @@
             schedule();
         }
     });
+
+    // Capture phase so we intercept Enter before Airtable's own handlers.
+    document.addEventListener('keydown', handleEnter, true);
 
     // Initial attempts, in case the field is already on screen.
     schedule();
