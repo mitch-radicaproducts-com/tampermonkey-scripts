@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Airtable Page - Add Entry Hotkey (= / +)
 // @namespace    radicaproducts.com
-// @version      1.0.0
-// @description  Press = or + anywhere on the Airtable interface page to click the circular "Add Entry" (+) button.
+// @version      1.1.0
+// @description  Press = or + anywhere on the Airtable interface page to click the circular "Add Entry" (+) button. Does nothing if the entry form is already open.
 // @author       Mitchell Sanchez
 // @match        https://airtable.com/*
 // @run-at       document-idle
@@ -25,6 +25,32 @@
     // ----------------------------------------------------------------------
 
     let firing = false;   // prevents double-clicks from key repeat
+
+    // Is the new-entry form already on screen? If so, the hotkey must do
+    // nothing — otherwise a second form stacks on top of the first.
+    function formIsOpen() {
+        // 1) Airtable's expanded-record / form dialog wrapper.
+        if (document.querySelector('[data-testid="page-element-expansion-stack-renderer-dialog"]')) {
+            return true;
+        }
+
+        // 2) Any modal dialog currently rendered.
+        const dialogs = document.querySelectorAll('[role="dialog"]');
+        for (const d of dialogs) {
+            if (d.getAttribute('aria-modal') === 'true') return true;
+            // A dialog holding a submit button is a form, open or animating in.
+            if (d.querySelector('button[type="submit"], [aria-label="Create"]')) return true;
+        }
+
+        // 3) Fallback: the form's own Create button visible anywhere.
+        const create = document.querySelector('button[aria-label="Create"], button[type="submit"]');
+        if (create) {
+            const rect = create.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) return true;
+        }
+
+        return false;
+    }
 
     // Find the circular "+" Add Entry button.
     function findAddButton() {
@@ -59,9 +85,24 @@
         return false;
     }
 
-    // Airtable's button is a <div role="button">, so fire a full pointer
-    // sequence — a bare .click() is not always enough for React handlers.
+    // Airtable's button is a <div role="button">. Try the plain native click
+    // FIRST and only escalate to a synthetic pointer sequence if the form did
+    // not appear — doing both at once opens two forms.
     function pressButton(el) {
+        if (typeof el.click === 'function') {
+            el.click();
+        } else {
+            dispatchPointerSequence(el);
+            return;
+        }
+
+        // Give React a moment; escalate only if nothing opened.
+        setTimeout(() => {
+            if (!formIsOpen()) dispatchPointerSequence(el);
+        }, 250);
+    }
+
+    function dispatchPointerSequence(el) {
         const target = el.querySelector('.circle') || el;
         const opts = { bubbles: true, cancelable: true, view: window, button: 0 };
 
@@ -77,10 +118,6 @@
 
         target.dispatchEvent(new MouseEvent('mouseup', opts));
         target.dispatchEvent(new MouseEvent('click', opts));
-
-        // Belt and braces: the native click path, in case the synthetic
-        // sequence above was swallowed.
-        if (typeof el.click === 'function') el.click();
     }
 
     function onKeyDown(e) {
@@ -90,6 +127,13 @@
 
         if (!TRIGGER_KEYS.includes(e.key)) return;
         if (!ALLOW_IN_TEXT_FIELDS && inTextField()) return;
+
+        // Form already up — swallow the key and do nothing.
+        if (formIsOpen()) {
+            e.preventDefault();
+            e.stopPropagation();
+            return;
+        }
 
         const btn = findAddButton();
         if (!btn) return;   // button not on screen — let the keypress through
@@ -102,7 +146,7 @@
 
         pressButton(btn);
 
-        setTimeout(() => { firing = false; }, 400);
+        setTimeout(() => { firing = false; }, 700);
     }
 
     // Capture phase so we get the key before Airtable's own shortcut handling.
