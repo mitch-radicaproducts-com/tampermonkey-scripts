@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Airtable — Restyle "Production Numbers" chart from "Palette" chart
 // @namespace    radicaproducts.com
-// @version      3.3.0
+// @version      3.4.0
 // @description  Reads the "Palette" chart once per page load — its rows, their order and their colors are the single source of truth — then holds the "Production Numbers" chart to that axis all day: missing workstations become 0 rows, existing bar lengths are never touched, Done segments take their workstation color, and In-Progress tips become diagonal yellow/white stripes.
 // @author       Mitch
 // @match        https://airtable.com/*
@@ -50,11 +50,11 @@
   // Diagonal stripe pattern for the yellow tips.
   const STRIPE = {
     id: 'tm-inprogress-stripes',
-    base: 'rgb(255, 214, 107)', // yellow
+    base: '#d54401', // yellow
     stripe: '#ffffff',          // white
     period: 6,                  // px: one yellow + one white band
-    width: 3,                   // px of white per period
-    angle: 45,                  // degrees
+    width: 5,                   // px of white per period
+    angle: 55,                  // degrees
   };
 
   // Vega band-scale constants, measured from Airtable's own render.
