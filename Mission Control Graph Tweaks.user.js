@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Airtable — Restyle "Production Numbers" chart from "Palette" chart
 // @namespace    radicaproducts.com
-// @version      3.1.0
+// @version      3.2.0
 // @description  Reads the "Palette" chart once per page load — its rows, their order and their colors are the single source of truth — then holds the "Production Numbers" chart to that axis all day: missing workstations become 0 rows, existing bar lengths are never touched, Done segments take their workstation color, and In-Progress tips become diagonal yellow/white stripes.
 // @author       Mitch
 // @match        https://airtable.com/*
@@ -28,6 +28,7 @@
   const RECOLOR  = true;   // recolor the green (Done) segments
   const STRIPES  = true;   // stripe the yellow (In-Progress) tips
   const ZERO_LABELS = true; // draw a "0" total on rows Airtable returned no data for
+  const DONE_ONLY_TOTALS = true; // the number at the end of a bar counts Done only
 
   // Fills that count as "the green series" in the target chart.
   const GREEN_FILLS = ['rgb(154, 224, 149)'];
@@ -106,9 +107,13 @@
       const i = part.indexOf(':');
       if (i > -1) out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
     });
+    const count = out['Distinct of chartPageElementAxisY_rowCount'] ||
+                  out['chartPageElementAxisY_rowCount'] ||
+                  out['chartPageElementAxisY_rowCountGroupTotalPerBar'];
     return {
       category: out['chartPageElementAxisX'] || out['Workstation (Color+Sort)'] || null,
       series: out['Status'] || null,
+      count: count === undefined ? null : parseFloat(count),
     };
   }
 
@@ -467,14 +472,16 @@
     [...a.yAxis.querySelectorAll('text')].slice(full.length).forEach((t) => t.remove());
 
     // 3. Per-bar total labels live outside the rows, so move them too.
-    placeTotals(a, full, desired, metrics);
+    placeTotals(a, full, desired, metrics, DONE_ONLY_TOTALS ? doneCounts(a) : null);
 
     setAttr(a.yAxis.parentElement.closest('g.mark-group.role-axis') || a.yAxis,
       'aria-label',
       `Y-axis for a discrete scale with ${full.length} values: ${full.join(', ')}`);
   }
 
-  function placeTotals(a, cats, rows, metrics) {
+  const fmtCount = (n) => (Math.round(n * 100) / 100).toString();
+
+  function placeTotals(a, cats, rows, metrics, dones) {
     const group = a.totals;
     if (!group) return;
 
@@ -514,6 +521,16 @@
 
       const m = /translate\(\s*(-?[\d.]+)\s*,/.exec(t.getAttribute('transform') || '');
       setAttr(t, 'transform', `translate(${round(m ? parseFloat(m[1]) : BAND.valueGap)},${y})`);
+
+      // Airtable's number counts every segment. Show the Done count instead,
+      // so an In-Progress tip doesn't inflate it.
+      if (dones) {
+        const done = fmtCount(dones.get(cat) || 0);
+        setText(t, done);
+        const aria = t.getAttribute('aria-label') || '';
+        setAttr(t, 'aria-label',
+          aria.replace(/(GroupTotalPerBar:\s*)[\d.]+/, `$1${done}`));
+      }
     });
 
     // Drop "0" labels for rows that now have real data, and any total whose
@@ -585,6 +602,29 @@
    * Recolour
    * ================================================================== */
 
+  function isYellow(el, series) {
+    const orig = normFill(originalFill(el));
+    return YELLOW_SET.has(orig) || (!!series && YELLOW_SERIES.includes(series));
+  }
+
+  function isGreen(el, series) {
+    const orig = normFill(originalFill(el));
+    if (orig === 'transparent' || orig === 'none') return false;
+    return GREEN_SET.has(orig) || (!!series && GREEN_SERIES.includes(series));
+  }
+
+  // How many Done records each row has, from the bars' own aria-labels.
+  function doneCounts(a) {
+    const out = new Map();
+    barsIn(a.chartEl).forEach((el) => {
+      const { category, series, count } = parseLabel(el);
+      if (!category || el.dataset.tmPlaceholder) return;
+      if (!isGreen(el, series) || isYellow(el, series)) return;
+      out.set(category, (out.get(category) || 0) + (count || 0));
+    });
+    return out;
+  }
+
   function recolor(a, colors) {
     const stripeFill = STRIPES ? ensureStripePattern(a.svg) : null;
 
@@ -594,12 +634,12 @@
       const orig = normFill(originalFill(el));
       if (orig === 'transparent' || orig === 'none') return; // placeholder row
 
-      if (YELLOW_SET.has(orig) || (series && YELLOW_SERIES.includes(series))) {
+      if (isYellow(el, series)) {
         if (stripeFill) setAttr(el, 'fill', stripeFill);
         return;
       }
       if (!RECOLOR) return;
-      if (!(GREEN_SET.has(orig) || (series && GREEN_SERIES.includes(series)))) return;
+      if (!isGreen(el, series)) return;
 
       const color = colors.get(category);
       if (!color) return;
