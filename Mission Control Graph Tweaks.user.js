@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Airtable — Restyle "Production Numbers" chart from "Palette" chart
 // @namespace    radicaproducts.com
-// @version      3.2.0
+// @version      3.3.0
 // @description  Reads the "Palette" chart once per page load — its rows, their order and their colors are the single source of truth — then holds the "Production Numbers" chart to that axis all day: missing workstations become 0 rows, existing bar lengths are never touched, Done segments take their workstation color, and In-Progress tips become diagonal yellow/white stripes.
 // @author       Mitch
 // @match        https://airtable.com/*
@@ -29,6 +29,13 @@
   const STRIPES  = true;   // stripe the yellow (In-Progress) tips
   const ZERO_LABELS = true; // draw a "0" total on rows Airtable returned no data for
   const DONE_ONLY_TOTALS = true; // the number at the end of a bar counts Done only
+  const HIDE_PADDING = true;     // make the "Hidden" spacer segments invisible
+  const TOTALS_AT_VISIBLE_END = true; // ...and put that number after the last visible segment
+
+  // Series values (bar aria-label "Status: ...") used only to pad a bar out to
+  // a fixed length. Kept in the DOM — they hold the x-axis domain steady and
+  // still answer to hover — but painted invisible.
+  const HIDDEN_SERIES = ['Hidden'];
 
   // Fills that count as "the green series" in the target chart.
   const GREEN_FILLS = ['rgb(154, 224, 149)'];
@@ -472,7 +479,9 @@
     [...a.yAxis.querySelectorAll('text')].slice(full.length).forEach((t) => t.remove());
 
     // 3. Per-bar total labels live outside the rows, so move them too.
-    placeTotals(a, full, desired, metrics, DONE_ONLY_TOTALS ? doneCounts(a) : null);
+    placeTotals(a, full, desired, metrics,
+      DONE_ONLY_TOTALS ? doneCounts(a) : null,
+      TOTALS_AT_VISIBLE_END ? visibleEnds(a) : null);
 
     setAttr(a.yAxis.parentElement.closest('g.mark-group.role-axis') || a.yAxis,
       'aria-label',
@@ -481,7 +490,7 @@
 
   const fmtCount = (n) => (Math.round(n * 100) / 100).toString();
 
-  function placeTotals(a, cats, rows, metrics, dones) {
+  function placeTotals(a, cats, rows, metrics, dones, ends) {
     const group = a.totals;
     if (!group) return;
 
@@ -519,8 +528,14 @@
         return;
       }
 
+      // x: just past the last visible segment when we can work that out,
+      // otherwise leave Airtable's own offset alone.
       const m = /translate\(\s*(-?[\d.]+)\s*,/.exec(t.getAttribute('transform') || '');
-      setAttr(t, 'transform', `translate(${round(m ? parseFloat(m[1]) : BAND.valueGap)},${y})`);
+      const end = ends && ends.get(cat);
+      const x = end !== undefined && end !== null
+        ? end + BAND.valueGap
+        : (m ? parseFloat(m[1]) : BAND.valueGap);
+      setAttr(t, 'transform', `translate(${round(x)},${y})`);
 
       // Airtable's number counts every segment. Show the Done count instead,
       // so an In-Progress tip doesn't inflate it.
@@ -602,6 +617,10 @@
    * Recolour
    * ================================================================== */
 
+  function isHidden(el, series) {
+    return !!series && HIDDEN_SERIES.includes(series);
+  }
+
   function isYellow(el, series) {
     const orig = normFill(originalFill(el));
     return YELLOW_SET.has(orig) || (!!series && YELLOW_SERIES.includes(series));
@@ -619,8 +638,26 @@
     barsIn(a.chartEl).forEach((el) => {
       const { category, series, count } = parseLabel(el);
       if (!category || el.dataset.tmPlaceholder) return;
-      if (!isGreen(el, series) || isYellow(el, series)) return;
+      if (isHidden(el, series) || isYellow(el, series)) return;
+      if (!isGreen(el, series)) return;
       out.set(category, (out.get(category) || 0) + (count || 0));
+    });
+    return out;
+  }
+
+  // Right edge of the last segment a viewer can actually see, per row, so the
+  // number lands against the bar instead of out past the invisible padding.
+  function visibleEnds(a) {
+    const out = new Map();
+    barsIn(a.chartEl).forEach((el) => {
+      const { category, series } = parseLabel(el);
+      if (!category || el.dataset.tmPlaceholder) return;
+      if (HIDE_PADDING && isHidden(el, series)) return;
+      const m = /^M\s*(-?[\d.]+)\s*,\s*-?[\d.]+\s*h\s*(-?[\d.]+)/.exec(el.getAttribute('d') || '');
+      if (!m) return;
+      const end = parseFloat(m[1]) + parseFloat(m[2]);
+      if (!isFinite(end)) return;
+      out.set(category, Math.max(out.get(category) || 0, end));
     });
     return out;
   }
@@ -631,6 +668,13 @@
     barsIn(a.chartEl).forEach((el) => {
       const { category, series } = parseLabel(el);
       if (!category) return;
+      if (isHidden(el, series)) {
+        // fill-opacity rather than fill: the segment keeps its real colour, so
+        // it stays hit-testable for hover and Airtable's own logic is unharmed.
+        if (HIDE_PADDING) setAttr(el, 'fill-opacity', '0');
+        return;
+      }
+
       const orig = normFill(originalFill(el));
       if (orig === 'transparent' || orig === 'none') return; // placeholder row
 
