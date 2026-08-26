@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Airtable — Restyle "Production Numbers" chart from "Palette" chart
 // @namespace    radicaproducts.com
-// @version      3.4.0
-// @description  Reads the "Palette" chart once per page load — its rows, their order and their colors are the single source of truth — then holds the "Production Numbers" chart to that axis all day: missing workstations become 0 rows, existing bar lengths are never touched, Done segments take their workstation color, and In-Progress tips become diagonal yellow/white stripes.
+// @version      3.5.0
+// @description  Reads the "Palette" chart once per page load — its rows, their order and their colors are the single source of truth — then holds the "Production Numbers" chart to that axis all day: missing workstations become 0 rows, existing bar lengths are never touched, Done segments take their workstation color, In-Progress tips become diagonal stripes overlaid with the serial numbers currently on that station, the "Hidden" padding segments are painted out, and the number at the end of each bar counts Done only.
 // @author       Mitch
 // @match        https://airtable.com/*
 // @run-at       document-idle
@@ -31,6 +31,34 @@
   const DONE_ONLY_TOTALS = true; // the number at the end of a bar counts Done only
   const HIDE_PADDING = true;     // make the "Hidden" spacer segments invisible
   const TOTALS_AT_VISIBLE_END = true; // ...and put that number after the last visible segment
+
+  // Overlay the in-progress serial numbers on top of each striped tip, read
+  // from a table elsewhere on the page and refreshed on every pass.
+  const SERIAL_OVERLAY = true;
+  const SERIAL_TABLE = 'Serial Numbers In-Progress'; // that element's label
+  const SERIAL_COLUMNS = {
+    status: 'Status',            // column headers, matched by title
+    serial: 'Serial Number',
+    station: 'Workstation Link',
+  };
+  // Only these statuses are overlaid. Empty = take every row in the table.
+  const SERIAL_STATUSES = ['In-Progress', 'In Progress'];
+  const SERIAL_STYLE = {
+    fontSize: 11,          // px
+    fill: 'var(--colors-foreground-default)',
+    bg: '#ffffff',         // white plate behind the text
+    bgOpacity: 1,          // 1 = solid; lower it to let the stripes show through
+    padX: 3,               // px of plate either side of the text
+    padY: 2,
+    radius: 2,
+    sort: true,            // sort serials so the string is stable day to day
+    separator: ', ',
+    clamp: true,           // keep long strings from running off the canvas
+    clampLeftToPlot: true, // ...and out of the y-axis label gutter on the left
+  };
+  // Push a bar's total number clear of its serial plate instead of letting the
+  // plate cover it. Only applies when TOTALS_AT_VISIBLE_END is on.
+  const NUDGE_TOTALS_PAST_SERIALS = true;
 
   // Series values (bar aria-label "Status: ...") used only to pad a bar out to
   // a fixed length. Kept in the DOM — they hold the x-axis domain steady and
@@ -172,7 +200,14 @@
     const scope = root.querySelector(':scope > g > g.mark-group.role-scope');
     const totals = root.querySelector('g.mark-text.role-mark');
 
-    return { chartEl, svg, root, plotW, plotH, yAxis, scope, totals };
+    // Left offset of the plot inside the SVG, and the SVG's own width: needed
+    // to work out how much room a label really has before it gets clipped.
+    const outerG = svg.querySelector(':scope > g');
+    const ox = /translate\(\s*(-?[\d.]+)/.exec(outerG && outerG.getAttribute('transform') || '');
+    const outerX = ox ? parseFloat(ox[1]) : 148;
+    const svgW = parseFloat(svg.getAttribute('width')) || (outerX + plotW);
+
+    return { chartEl, svg, root, plotW, plotH, yAxis, scope, totals, outerX, svgW };
   }
 
   const rowGroups = (a) =>
@@ -269,6 +304,207 @@
     const src = yAxis && (yAxis.getAttribute('aria-label') || '');
     const m = /with (\d+) value/.exec(src || '');
     return m ? parseInt(m[1], 10) : 0;
+  }
+
+  /* ================================================================== *
+   * In-progress serial numbers (read from a table elsewhere on the page)
+   * ================================================================== */
+
+  // Airtable renders these tables with react-virtualized, so rows scrolled out
+  // of view simply aren't in the DOM — and the whole element may be unmounted
+  // while the chart is on screen. A partial read would wrongly blank a
+  // workstation, so only a complete read replaces what we know.
+  let serialCache = new Map();
+
+  const EMPTY_CELL = /^[\s\u2013\u2014-]*$/; // "", "-", en/em dash
+
+  function findTable(label) {
+    for (const el of document.querySelectorAll('[data-elementtype="levels"]')) {
+      const l = el.querySelector('[data-testid="page-element-label"]');
+      if (l && l.textContent.trim() === label) return el;
+    }
+    return null;
+  }
+
+  // Column header title -> aria-colindex, so reordering columns can't break us.
+  function columnIndex(box) {
+    const map = new Map();
+    box.querySelectorAll('[role="columnheader"][aria-colindex]').forEach((h) => {
+      const span = h.querySelector('[title]');
+      const name = (span && span.getAttribute('title') || h.textContent).trim();
+      if (name && !map.has(name)) map.set(name, h.getAttribute('aria-colindex'));
+    });
+    return map;
+  }
+
+  function readSerials() {
+    if (!SERIAL_OVERLAY) return serialCache;
+
+    const box = findTable(SERIAL_TABLE);
+    if (!box) return serialCache; // element not mounted: keep what we had
+
+    const grid = box.querySelector('[role="treegrid"], [role="grid"]');
+    const declared = grid ? parseInt(grid.getAttribute('aria-rowcount') || '0', 10) : 0;
+    const rows = [...box.querySelectorAll('[role="row"][aria-rowindex]')];
+
+    // A short read means rows are virtualised away. An empty table is only
+    // believable when it says it has no rows.
+    if (declared && rows.length < declared) return serialCache;
+    if (!declared && !rows.length) return serialCache;
+
+    const cols = columnIndex(box);
+    const cell = (row, name, fallback) => {
+      const idx = cols.get(name) || fallback;
+      const c = idx && row.querySelector(`[aria-colindex="${idx}"]`);
+      return c ? c.textContent.trim().replace(/\s+/g, ' ') : '';
+    };
+
+    const found = new Map();
+    rows.forEach((row) => {
+      const status = cell(row, SERIAL_COLUMNS.status, '1');
+      if (SERIAL_STATUSES.length && !SERIAL_STATUSES.includes(status)) return;
+      const serial = cell(row, SERIAL_COLUMNS.serial, '2');
+      const station = cell(row, SERIAL_COLUMNS.station, '3');
+      if (!station || EMPTY_CELL.test(station)) return;
+      if (!found.has(station)) found.set(station, []);
+      if (EMPTY_CELL.test(serial)) return;      // station present, nothing on it
+      const list = found.get(station);
+      if (!list.includes(serial)) list.push(serial);
+    });
+
+    serialCache = found;
+    return serialCache;
+  }
+
+  function serialText(list) {
+    if (!list || !list.length) return '';
+    const out = SERIAL_STYLE.sort
+      ? list.slice().sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+      : list;
+    return out.join(SERIAL_STYLE.separator);
+  }
+
+  // Width of a string in this font. Real measurement when the browser offers
+  // it, otherwise a per-character estimate.
+  function textWidth(node, s) {
+    if (typeof node.getComputedTextLength === 'function') {
+      try {
+        const w = node.getComputedTextLength();
+        if (w) return w;
+      } catch (e) { /* not rendered yet */ }
+    }
+    let w = 0;
+    for (const ch of s) {
+      w += ch === ' ' ? 0.28 : (ch === ',' || ch === '.' || ch === '\u2013') ? 0.3 : 0.61;
+    }
+    return w * SERIAL_STYLE.fontSize;
+  }
+
+  // x span of each row's striped In-Progress segment(s), in plot coordinates.
+  function wipSpans(a) {
+    const out = new Map();
+    barsIn(a.chartEl).forEach((el) => {
+      const { category, series } = parseLabel(el);
+      if (!category || el.dataset.tmPlaceholder) return;
+      if (isHidden(el, series) || !isYellow(el, series)) return;
+      const g = barGeom(el);
+      if (!g || !(g.w > 0)) return;
+      const s = out.get(category) || { x0: Infinity, x1: -Infinity };
+      s.x0 = Math.min(s.x0, g.x);
+      s.x1 = Math.max(s.x1, g.x + g.w);
+      out.set(category, s);
+    });
+    return out;
+  }
+
+  // Draws the plates. Returns cat -> right edge, so the totals can dodge them.
+  function placeSerials(a, cats, metrics) {
+    const edges = new Map();
+    if (!SERIAL_OVERLAY || !a.root) return edges;
+
+    const serials = readSerials();
+    const spans = wipSpans(a);
+
+    let layer = a.root.querySelector(':scope > g[data-tm-serials]');
+    if (!layer) {
+      layer = document.createElementNS(SVG_NS, 'g');
+      layer.setAttribute('data-tm-serials', '1');
+      layer.setAttribute('aria-hidden', 'true');
+      a.root.appendChild(layer);
+    } else if (a.root.lastElementChild !== layer) {
+      a.root.appendChild(layer); // stay on top of the bars Vega just redrew
+    }
+
+    const existing = new Map();
+    [...layer.children].forEach((g) => {
+      const cat = g.dataset.tmSerialCat;
+      if (cat && !existing.has(cat)) existing.set(cat, g); else g.remove();
+    });
+
+    const wanted = [];
+    const S = SERIAL_STYLE;
+    const half = S.fontSize / 2;
+
+    cats.forEach((cat, i) => {
+      const span = spans.get(cat);
+      const label = serialText(serials.get(cat));
+      if (!span || !label) return;
+
+      let g = existing.get(cat);
+      let rect, text;
+      if (!g) {
+        g = document.createElementNS(SVG_NS, 'g');
+        g.dataset.tmSerialCat = cat;
+        rect = document.createElementNS(SVG_NS, 'rect');
+        text = document.createElementNS(SVG_NS, 'text');
+        text.setAttribute('text-anchor', 'middle');
+        text.setAttribute('font-size', `${S.fontSize}px`);
+        text.setAttribute('fill', S.fill);
+        const tpl = a.totals && a.totals.querySelector('text');
+        const family = tpl && tpl.getAttribute('font-family');
+        if (family) text.setAttribute('font-family', family);
+        rect.setAttribute('fill', S.bg);
+        rect.setAttribute('fill-opacity', String(S.bgOpacity));
+        rect.setAttribute('rx', String(S.radius));
+        g.appendChild(rect);
+        g.appendChild(text);
+        layer.appendChild(g);
+      } else {
+        rect = g.querySelector('rect');
+        text = g.querySelector('text');
+      }
+
+      setText(text, label);
+      const w = textWidth(text, label);
+      const centre = metrics.top + i * metrics.step + metrics.height / 2;
+
+      // Centred on the striped segment, then nudged back inside the canvas if
+      // the string is wider than the room available.
+      let cx = (span.x0 + span.x1) / 2;
+      if (S.clamp) {
+        const room = w / 2 + S.padX;
+        const maxX = a.svgW - a.outerX - 1;   // right edge of the drawable area
+        const minX = S.clampLeftToPlot ? 1 : -a.outerX + 1;
+        if (cx + room > maxX) cx = maxX - room;
+        if (cx - room < minX) cx = minX + room;
+      }
+
+      setAttr(text, 'transform', `translate(${round(cx)},${round(centre + BAND.labelDy)})`);
+      setAttr(rect, 'x', round(cx - w / 2 - S.padX));
+      setAttr(rect, 'y', round(centre - half - S.padY));
+      setAttr(rect, 'width', round(w + S.padX * 2));
+      setAttr(rect, 'height', round(S.fontSize + S.padY * 2));
+
+      edges.set(cat, cx + w / 2 + S.padX);
+      wanted.push(g);
+    });
+
+    [...layer.children].forEach((g) => { if (!wanted.includes(g)) g.remove(); });
+    wanted.forEach((g, i) => {
+      if (layer.children[i] !== g) layer.insertBefore(g, layer.children[i] || null);
+    });
+
+    return edges;
   }
 
   /* ================================================================== *
@@ -478,10 +714,15 @@
     // Remove any leftover labels beyond the row count.
     [...a.yAxis.querySelectorAll('text')].slice(full.length).forEach((t) => t.remove());
 
-    // 3. Per-bar total labels live outside the rows, so move them too.
+    // 3. Serial-number plates over the striped tips. Drawn before the totals
+    //    are placed so a total can be moved clear of its plate.
+    const plates = placeSerials(a, full, metrics);
+
+    // 4. Per-bar total labels live outside the rows, so move them too.
     placeTotals(a, full, desired, metrics,
       DONE_ONLY_TOTALS ? doneCounts(a) : null,
-      TOTALS_AT_VISIBLE_END ? visibleEnds(a) : null);
+      TOTALS_AT_VISIBLE_END ? visibleEnds(a) : null,
+      NUDGE_TOTALS_PAST_SERIALS ? plates : null);
 
     setAttr(a.yAxis.parentElement.closest('g.mark-group.role-axis') || a.yAxis,
       'aria-label',
@@ -490,7 +731,7 @@
 
   const fmtCount = (n) => (Math.round(n * 100) / 100).toString();
 
-  function placeTotals(a, cats, rows, metrics, dones, ends) {
+  function placeTotals(a, cats, rows, metrics, dones, ends, plates) {
     const group = a.totals;
     if (!group) return;
 
@@ -532,9 +773,17 @@
       // otherwise leave Airtable's own offset alone.
       const m = /translate\(\s*(-?[\d.]+)\s*,/.exec(t.getAttribute('transform') || '');
       const end = ends && ends.get(cat);
-      const x = end !== undefined && end !== null
+      let x = end !== undefined && end !== null
         ? end + BAND.valueGap
         : (m ? parseFloat(m[1]) : BAND.valueGap);
+
+      // A serial plate centred on the striped tip usually covers this spot.
+      // Step out past it, but never so far that the number leaves the canvas.
+      const plate = plates && plates.get(cat);
+      if (plate !== undefined && plate + BAND.valueGap > x) {
+        const room = a.svgW - a.outerX - 12;
+        x = Math.min(plate + BAND.valueGap, Math.max(x, room));
+      }
       setAttr(t, 'transform', `translate(${round(x)},${y})`);
 
       // Airtable's number counts every segment. Show the Done count instead,
