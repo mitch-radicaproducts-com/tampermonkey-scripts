@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Airtable — Restyle "Production Numbers" chart from "Palette" chart
 // @namespace    radicaproducts.com
-// @version      3.5.0
-// @description  Reads the "Palette" chart once per page load — its rows, their order and their colors are the single source of truth — then holds the "Production Numbers" chart to that axis all day: missing workstations become 0 rows, existing bar lengths are never touched, Done segments take their workstation color, In-Progress tips become diagonal stripes overlaid with the serial numbers currently on that station, the "Hidden" padding segments are painted out, and the number at the end of each bar counts Done only.
+// @version      3.7.0
+// @description  Reads the "Palette" chart once per page load — its rows, their order and their colors are the single source of truth — then holds the "Production Numbers" chart to that axis all day: missing workstations become 0 rows, existing bar lengths are never touched, Done segments take their workstation color, In-Progress tips become diagonal stripes overlaid with the serial numbers currently on that station, the "Hidden" padding segments are painted out, and the end of each bar carries that station's takt time, with a thumbs-up after it when that unit is on time.
 // @author       Mitch
 // @match        https://airtable.com/*
 // @run-at       document-idle
@@ -27,10 +27,12 @@
   const FIX_AXIS = true;   // add missing workstations + enforce palette order
   const RECOLOR  = true;   // recolor the green (Done) segments
   const STRIPES  = true;   // stripe the yellow (In-Progress) tips
-  const ZERO_LABELS = true; // draw a "0" total on rows Airtable returned no data for
-  const DONE_ONLY_TOTALS = true; // the number at the end of a bar counts Done only
+  const ZERO_LABELS = true; // in count mode, draw a "0" on rows Airtable had no data for
+  // Replace the number at the end of each bar with that station's takt time,
+  // read from the serial table. Rows with nothing in progress show nothing.
+  const TAKT_TOTALS = true;
   const HIDE_PADDING = true;     // make the "Hidden" spacer segments invisible
-  const TOTALS_AT_VISIBLE_END = true; // ...and put that number after the last visible segment
+  const TOTALS_AT_VISIBLE_END = true; // ...and put the end label after the last visible segment
 
   // Overlay the in-progress serial numbers on top of each striped tip, read
   // from a table elsewhere on the page and refreshed on every pass.
@@ -40,6 +42,20 @@
     status: 'Status',            // column headers, matched by title
     serial: 'Serial Number',
     station: 'Workstation Link',
+    takt: 'Takt Time',
+    ontime: 'On Time',          // checkbox: green thumb = true, white = false
+  };
+  // Workstations that get no takt time and no thumb, whatever the table says.
+  const TAKT_EXCLUDE = ['GOAL'];
+  // The on-time mark. Drawn with Airtable's own thumbs-up sprite, so it is the
+  // same glyph the table shows; the href is read off the table at runtime.
+  const ONTIME_ICON = {
+    enabled: true,
+    size: 12,               // px square
+    gap: 3,                 // px between the takt text and the thumb
+    fill: 'rgb(4, 138, 14)',// Airtable's checked green
+    href: '/icons/icon_definitions.svg#ThumbsUpFill', // fallback if not found
+    glyph: '\ud83d\udc4d',  // last-resort fallback if the sprite won't load
   };
   // Only these statuses are overlaid. Empty = take every row in the table.
   const SERIAL_STATUSES = ['In-Progress', 'In Progress'];
@@ -56,7 +72,7 @@
     clamp: true,           // keep long strings from running off the canvas
     clampLeftToPlot: true, // ...and out of the y-axis label gutter on the left
   };
-  // Push a bar's total number clear of its serial plate instead of letting the
+  // Push a bar's end label clear of its serial plate instead of letting the
   // plate cover it. Only applies when TOTALS_AT_VISIBLE_END is on.
   const NUDGE_TOTALS_PAST_SERIALS = true;
 
@@ -353,35 +369,85 @@
     if (!declared && !rows.length) return serialCache;
 
     const cols = columnIndex(box);
-    const cell = (row, name, fallback) => {
+    const cellEl = (row, name, fallback) => {
       const idx = cols.get(name) || fallback;
-      const c = idx && row.querySelector(`[aria-colindex="${idx}"]`);
+      return (idx && row.querySelector(`[aria-colindex="${idx}"]`)) || null;
+    };
+    const cell = (row, name, fallback) => {
+      const c = cellEl(row, name, fallback);
       return c ? c.textContent.trim().replace(/\s+/g, ' ') : '';
     };
+    // Checkbox columns carry no text: the state is on the checkbox itself.
+    // A green thumb is aria-checked="true"; a white one is "false".
+    const checked = (row, name, fallback) => {
+      const c = cellEl(row, name, fallback);
+      if (!c) return false;
+      const box2 = c.querySelector('[role="checkbox"][aria-checked]');
+      const on = box2
+        ? box2.getAttribute('aria-checked') === 'true'
+        : /,\s*checked\s*$/i.test((c.querySelector('[aria-label]') || c)
+            .getAttribute('aria-label') || '');
+      if (on) rememberIconHref(c);
+      return on;
+    };
 
+    // One entry per in-progress unit: its serial, its takt time, its on-time flag.
     const found = new Map();
     rows.forEach((row) => {
       const status = cell(row, SERIAL_COLUMNS.status, '1');
       if (SERIAL_STATUSES.length && !SERIAL_STATUSES.includes(status)) return;
       const serial = cell(row, SERIAL_COLUMNS.serial, '2');
       const station = cell(row, SERIAL_COLUMNS.station, '3');
+      const takt = cell(row, SERIAL_COLUMNS.takt, '4');
+      const onTime = checked(row, SERIAL_COLUMNS.ontime, '5');
       if (!station || EMPTY_CELL.test(station)) return;
       if (!found.has(station)) found.set(station, []);
-      if (EMPTY_CELL.test(serial)) return;      // station present, nothing on it
       const list = found.get(station);
-      if (!list.includes(serial)) list.push(serial);
+      if (EMPTY_CELL.test(serial) && EMPTY_CELL.test(takt)) return; // nothing on it
+      if (list.some((e) => e.serial === serial && e.takt === takt)) return;
+      list.push({
+        serial: EMPTY_CELL.test(serial) ? '' : serial,
+        takt: EMPTY_CELL.test(takt) ? '' : takt,
+        onTime,
+      });
     });
+
+    if (SERIAL_STYLE.sort) {
+      found.forEach((list) => list.sort(
+        (a, b) => a.serial.localeCompare(b.serial, undefined, { numeric: true })));
+    }
 
     serialCache = found;
     return serialCache;
   }
 
-  function serialText(list) {
-    if (!list || !list.length) return '';
-    const out = SERIAL_STYLE.sort
-      ? list.slice().sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
-      : list;
-    return out.join(SERIAL_STYLE.separator);
+  // Serials and takt times are joined in the same order, so the string over a
+  // bar and the string after it line up unit for unit.
+  const joinField = (list, key) => (list || [])
+    .map((e) => e[key])
+    .filter(Boolean)
+    .join(SERIAL_STYLE.separator);
+
+  const serialText = (list) => joinField(list, 'serial');
+
+  // Airtable's thumbs-up sprite, lifted from the table so the version hash in
+  // the URL always matches the one the page is already using.
+  let iconHref = null;
+  function rememberIconHref(cellNode) {
+    if (iconHref) return iconHref;
+    const u = cellNode.querySelector('use[href], use[*|href]');
+    const h = u && (u.getAttribute('href') || u.getAttribute('xlink:href'));
+    if (h && h.indexOf('#') > -1) iconHref = h;
+    return iconHref;
+  }
+
+  // Per-character fallback for when nothing has been laid out yet.
+  function estimateWidth(s) {
+    let w = 0;
+    for (const ch of s || '') {
+      w += ch === ' ' ? 0.28 : (ch === ',' || ch === '.' || ch === '\u2013') ? 0.3 : 0.61;
+    }
+    return w * SERIAL_STYLE.fontSize;
   }
 
   // Width of a string in this font. Real measurement when the browser offers
@@ -393,11 +459,20 @@
         if (w) return w;
       } catch (e) { /* not rendered yet */ }
     }
-    let w = 0;
-    for (const ch of s) {
-      w += ch === ' ' ? 0.28 : (ch === ',' || ch === '.' || ch === '\u2013') ? 0.3 : 0.61;
+    return estimateWidth(s);
+  }
+
+  // Width of the first `chars` characters of the node's own text: where inside
+  // a label a given unit's takt time ends.
+  function prefixWidth(node, s, chars) {
+    if (!chars) return 0;
+    if (typeof node.getSubStringLength === 'function' && node.textContent === s) {
+      try {
+        const w = node.getSubStringLength(0, chars);
+        if (w) return w;
+      } catch (e) { /* not rendered yet */ }
     }
-    return w * SERIAL_STYLE.fontSize;
+    return estimateWidth(s.slice(0, chars));
   }
 
   // x span of each row's striped In-Progress segment(s), in plot coordinates.
@@ -417,6 +492,29 @@
     return out;
   }
 
+  // Our two drawing layers, always the last children of the plot group so the
+  // bars Vega just redrew can't paint over them. Order: plates, then thumbs.
+  const OVERLAYS = ['data-tm-serials', 'data-tm-ontime'];
+  function overlayLayers(a) {
+    const out = {};
+    const nodes = OVERLAYS.map((attr) => {
+      let g = a.root.querySelector(`:scope > g[${attr}]`);
+      if (!g) {
+        g = document.createElementNS(SVG_NS, 'g');
+        g.setAttribute(attr, '1');
+        g.setAttribute('aria-hidden', 'true');
+        a.root.appendChild(g);
+      }
+      return g;
+    });
+    // Reorder only when they aren't already the final children, in order.
+    const tail = [...a.root.children].slice(-nodes.length);
+    if (nodes.some((g, i) => tail[i] !== g)) nodes.forEach((g) => a.root.appendChild(g));
+    out.serials = nodes[0];
+    out.ontime = nodes[1];
+    return out;
+  }
+
   // Draws the plates. Returns cat -> right edge, so the totals can dodge them.
   function placeSerials(a, cats, metrics) {
     const edges = new Map();
@@ -425,15 +523,7 @@
     const serials = readSerials();
     const spans = wipSpans(a);
 
-    let layer = a.root.querySelector(':scope > g[data-tm-serials]');
-    if (!layer) {
-      layer = document.createElementNS(SVG_NS, 'g');
-      layer.setAttribute('data-tm-serials', '1');
-      layer.setAttribute('aria-hidden', 'true');
-      a.root.appendChild(layer);
-    } else if (a.root.lastElementChild !== layer) {
-      a.root.appendChild(layer); // stay on top of the bars Vega just redrew
-    }
+    const layer = overlayLayers(a).serials;
 
     const existing = new Map();
     [...layer.children].forEach((g) => {
@@ -718,9 +808,9 @@
     //    are placed so a total can be moved clear of its plate.
     const plates = placeSerials(a, full, metrics);
 
-    // 4. Per-bar total labels live outside the rows, so move them too.
+    // 4. Per-bar end labels live outside the rows, so move them too.
     placeTotals(a, full, desired, metrics,
-      DONE_ONLY_TOTALS ? doneCounts(a) : null,
+      TAKT_TOTALS ? taktByStation() : null,
       TOTALS_AT_VISIBLE_END ? visibleEnds(a) : null,
       NUDGE_TOTALS_PAST_SERIALS ? plates : null);
 
@@ -729,14 +819,117 @@
       `Y-axis for a discrete scale with ${full.length} values: ${full.join(', ')}`);
   }
 
-  const fmtCount = (n) => (Math.round(n * 100) / 100).toString();
+  // Station -> { text, units }, from whatever the serial table last told us.
+  // `units` keeps each unit's own takt and on-time flag, in the same order as
+  // the string, so a thumb can be placed against the right one.
+  function taktByStation() {
+    const out = new Map();
+    readSerials().forEach((list, station) => {
+      if (TAKT_EXCLUDE.includes(station)) return; // GOAL: no clock, no thumb
+      const units = (list || []).filter((e) => e.takt);
+      if (!units.length) return;
+      out.set(station, {
+        text: units.map((e) => e.takt).join(SERIAL_STYLE.separator),
+        units,
+      });
+    });
+    return out;
+  }
 
-  function placeTotals(a, cats, rows, metrics, dones, ends, plates) {
+  // One thumbs-up per on-time unit, sitting just after that unit's takt time.
+  function placeThumbs(a, cat, labelNode, label, labelX, centre, info) {
+    const layer = overlayLayers(a).ontime;
+    let g = layer.querySelector(`:scope > g[data-tm-ontime-cat="${cssEscape(cat)}"]`);
+    const units = (ONTIME_ICON.enabled && info && info.units) || [];
+    const marks = [];
+
+    if (units.some((u) => u.onTime)) {
+      // Walk the label string, unit by unit, tracking where each one ends.
+      const sep = SERIAL_STYLE.separator;
+      const measure = (chars) => prefixWidth(
+        labelNode || { textContent: label }, label, chars);
+      let chars = 0;
+      let shift = 0; // room already taken by thumbs drawn further left
+      units.forEach((u, i) => {
+        chars += u.takt.length;
+        if (u.onTime) {
+          marks.push(measure(chars) + shift + ONTIME_ICON.gap);
+          shift += ONTIME_ICON.gap + ONTIME_ICON.size;
+        }
+        if (i < units.length - 1) chars += sep.length;
+      });
+    }
+
+    if (!marks.length) {
+      if (g) g.remove();
+      return 0;
+    }
+
+    if (!g) {
+      g = document.createElementNS(SVG_NS, 'g');
+      g.setAttribute('data-tm-ontime-cat', cat);
+      layer.appendChild(g);
+    }
+
+    const kids = [...g.children];
+    marks.forEach((dx, i) => {
+      let icon = kids[i];
+      if (!icon) {
+        icon = makeThumb();
+        g.appendChild(icon);
+      }
+      setAttr(icon, 'x', round(labelX + dx));
+      setAttr(icon, 'y', round(centre - ONTIME_ICON.size / 2));
+    });
+    kids.slice(marks.length).forEach((n) => n.remove());
+
+    // Total width this row's thumbs add to the label.
+    return marks.length * (ONTIME_ICON.gap + ONTIME_ICON.size);
+  }
+
+  // A nested <svg> holding Airtable's own sprite, so it scales cleanly and can
+  // be positioned with plain x/y like any other mark.
+  function makeThumb() {
+    const svg = document.createElementNS(SVG_NS, 'svg');
+    svg.setAttribute('width', ONTIME_ICON.size);
+    svg.setAttribute('height', ONTIME_ICON.size);
+    svg.setAttribute('viewBox', '0 0 16 16');
+    svg.setAttribute('overflow', 'visible');
+    const href = iconHref || ONTIME_ICON.href;
+    if (href) {
+      const use = document.createElementNS(SVG_NS, 'use');
+      use.setAttribute('href', href);
+      use.setAttributeNS('http://www.w3.org/1999/xlink', 'xlink:href', href);
+      use.setAttribute('fill', ONTIME_ICON.fill);
+      svg.appendChild(use);
+    } else {
+      const t = document.createElementNS(SVG_NS, 'text');
+      t.setAttribute('font-size', '13');
+      t.setAttribute('y', '13');
+      t.textContent = ONTIME_ICON.glyph;
+      svg.appendChild(t);
+    }
+    return svg;
+  }
+
+  // Attribute-selector-safe category name.
+  const cssEscape = (s) => String(s).replace(/["\\]/g, '\\$&');
+
+  // Drop thumb groups for rows that no longer have any.
+  function pruneThumbs(a, keep) {
+    const layer = a.root.querySelector(':scope > g[data-tm-ontime]');
+    if (!layer) return;
+    [...layer.children].forEach((g) => {
+      if (!keep.has(g.dataset.tmOntimeCat)) g.remove();
+    });
+  }
+
+  function placeTotals(a, cats, rows, metrics, takts, ends, plates) {
     const group = a.totals;
     if (!group) return;
 
     const real = new Map();  // Airtable's own totals
-    const mine = new Map();  // "0" totals this script added
+    const mine = new Map();  // end labels this script added itself
     [...group.querySelectorAll('text')].forEach((t) => {
       const cat = parseLabel(t).category;
       if (!cat) return;
@@ -746,27 +939,47 @@
 
     const template = group.querySelector('text:not([data-tm-zero])') ||
                      group.querySelector('text');
-    const empty = new Set();
+    const kept = new Set();   // rows whose script-made label is still wanted
+    const thumbed = new Set(); // rows carrying an on-time thumb
 
     cats.forEach((cat, i) => {
       const centre = metrics.top + i * metrics.step + metrics.height / 2;
       const y = round(centre + BAND.valueDy);
+      // In takt mode this is the whole content of the label: a station with
+      // nothing in progress has no takt clock, so it shows nothing, and the
+      // stations in TAKT_EXCLUDE never get one at all.
+      const info = takts ? takts.get(cat) : null;
+      const takt = takts ? (info ? info.text : '') : null;
+      const thumbs = (info && info.units.filter((u) => u.onTime).length) || 0;
+      const reserve = thumbs * (ONTIME_ICON.gap + ONTIME_ICON.size);
       let t = real.get(cat);
 
       if (!t) {
-        empty.add(cat);
-        if (!ZERO_LABELS || !template) return;
+        // Airtable gave this row no label of its own (a row we invented, or a
+        // row with no records). Add one only if there's something to say — an
+        // idle station has no takt clock running, so it gets nothing.
+        const want = takts ? takt : (ZERO_LABELS ? '0' : '');
+        if (!want || !template) { placeThumbs(a, cat, null, '', 0, centre, null); return; }
         t = mine.get(cat);
         if (!t) {
           t = template.cloneNode(true);
           t.dataset.tmZero = '1';
-          setAttr(t, 'aria-label',
-            `chartPageElementAxisY_rowCountGroupTotalPerBar: 0; chartPageElementAxisX: ${cat}`);
-          setText(t, '0');
           group.appendChild(t);
         }
+        kept.add(cat);
+        setAttr(t, 'aria-label',
+          `${takts ? 'Takt Time' : 'chartPageElementAxisY_rowCountGroupTotalPerBar'}: ` +
+          `${want}; chartPageElementAxisX: ${cat}`);
+        setText(t, want);
         setAttr(t, 'transform', `translate(${BAND.valueGap},${y})`);
+        if (placeThumbs(a, cat, t, want, BAND.valueGap, centre, info)) thumbed.add(cat);
         return;
+      }
+
+      if (takts) {
+        setText(t, takt);
+        setAttr(t, 'aria-label',
+          `Takt Time: ${takt}${thumbs ? ', on time' : ''}; chartPageElementAxisX: ${cat}`);
       }
 
       // x: just past the last visible segment when we can work that out,
@@ -777,33 +990,32 @@
         ? end + BAND.valueGap
         : (m ? parseFloat(m[1]) : BAND.valueGap);
 
+      // Keep the label inside the canvas, allowing for its own width plus any
+      // thumbs hanging off it — takt strings are several times wider than the
+      // counts used to be.
+      const maxX = a.svgW - a.outerX - textWidth(t, t.textContent) - reserve - 2;
+
       // A serial plate centred on the striped tip usually covers this spot.
-      // Step out past it, but never so far that the number leaves the canvas.
+      // Step out past it, but never so far that the label leaves the canvas.
       const plate = plates && plates.get(cat);
       if (plate !== undefined && plate + BAND.valueGap > x) {
-        const room = a.svgW - a.outerX - 12;
-        x = Math.min(plate + BAND.valueGap, Math.max(x, room));
+        x = Math.min(plate + BAND.valueGap, Math.max(x, maxX));
       }
+      if (x > maxX) x = Math.max(maxX, 0);
       setAttr(t, 'transform', `translate(${round(x)},${y})`);
-
-      // Airtable's number counts every segment. Show the Done count instead,
-      // so an In-Progress tip doesn't inflate it.
-      if (dones) {
-        const done = fmtCount(dones.get(cat) || 0);
-        setText(t, done);
-        const aria = t.getAttribute('aria-label') || '';
-        setAttr(t, 'aria-label',
-          aria.replace(/(GroupTotalPerBar:\s*)[\d.]+/, `$1${done}`));
-      }
+      if (placeThumbs(a, cat, t, t.textContent, x, centre, info)) thumbed.add(cat);
     });
 
-    // Drop "0" labels for rows that now have real data, and any total whose
+    pruneThumbs(a, thumbed);
+
+    // Drop labels we made that are no longer wanted (the row has real data of
+    // its own now, or there's nothing left to show on it), and any label whose
     // row is no longer on the axis.
     const shown = new Set(cats);
     [...group.querySelectorAll('text')].forEach((t) => {
       const cat = parseLabel(t).category;
       if (!cat) return;
-      if (t.dataset.tmZero ? !empty.has(cat) : (PALETTE_IS_COMPLETE && !shown.has(cat))) {
+      if (t.dataset.tmZero ? !kept.has(cat) : (PALETTE_IS_COMPLETE && !shown.has(cat))) {
         t.remove();
       }
     });
@@ -881,21 +1093,8 @@
     return GREEN_SET.has(orig) || (!!series && GREEN_SERIES.includes(series));
   }
 
-  // How many Done records each row has, from the bars' own aria-labels.
-  function doneCounts(a) {
-    const out = new Map();
-    barsIn(a.chartEl).forEach((el) => {
-      const { category, series, count } = parseLabel(el);
-      if (!category || el.dataset.tmPlaceholder) return;
-      if (isHidden(el, series) || isYellow(el, series)) return;
-      if (!isGreen(el, series)) return;
-      out.set(category, (out.get(category) || 0) + (count || 0));
-    });
-    return out;
-  }
-
   // Right edge of the last segment a viewer can actually see, per row, so the
-  // number lands against the bar instead of out past the invisible padding.
+  // label lands against the bar instead of out past the invisible padding.
   function visibleEnds(a) {
     const out = new Map();
     barsIn(a.chartEl).forEach((el) => {
