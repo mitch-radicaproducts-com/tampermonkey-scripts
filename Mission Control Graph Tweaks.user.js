@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Airtable — Restyle "Production Numbers" chart from "Palette" chart
 // @namespace    radicaproducts.com
-// @version      3.7.0
-// @description  Reads the "Palette" chart once per page load — its rows, their order and their colors are the single source of truth — then holds the "Production Numbers" chart to that axis all day: missing workstations become 0 rows, existing bar lengths are never touched, Done segments take their workstation color, In-Progress tips become diagonal stripes overlaid with the serial numbers currently on that station, the "Hidden" padding segments are painted out, and the end of each bar carries that station's takt time, with a thumbs-up after it when that unit is on time.
+// @version      3.8.0
+// @description  Reads the "Palette" chart once per page load — its rows, their order and their colors are the single source of truth — then holds the "Production Numbers" chart to that axis all day: missing workstations become 0 rows, existing bar lengths are never touched, Done segments take their workstation color, In-Progress tips become diagonal stripes overlaid with the serial numbers currently on that station (a serial in progress at a second station is drawn in the stripe colour), the "Hidden" padding segments are painted out, and the end of each bar carries that station's takt time, with a thumbs-up after it when a single on-time unit is on that station.
 // @author       Mitch
 // @match        https://airtable.com/*
 // @run-at       document-idle
@@ -72,6 +72,11 @@
     clamp: true,           // keep long strings from running off the canvas
     clampLeftToPlot: true, // ...and out of the y-axis label gutter on the left
   };
+  // A serial can be in progress at more than one station at once. The first
+  // station it appears at (reading down the axis) keeps the normal text colour;
+  // every later appearance is drawn in the stripe colour to flag the repeat.
+  const REPEAT_SERIAL_COLOR = 'stripe'; // 'stripe' = match STRIPE.base, or any CSS colour
+
   // Push a bar's end label clear of its serial plate instead of letting the
   // plate cover it. Only applies when TOTALS_AT_VISIBLE_END is on.
   const NUDGE_TOTALS_PAST_SERIALS = true;
@@ -515,8 +520,37 @@
     return out;
   }
 
+  // A plate's text is built from one <tspan> per serial (plus one per comma) so
+  // a repeat appearance can be coloured on its own without splitting the plate.
+  function paintSerials(text, entries, seen) {
+    const repeat = REPEAT_SERIAL_COLOR === 'stripe' ? STRIPE.base : REPEAT_SERIAL_COLOR;
+    const want = [];
+    entries.forEach((e, i) => {
+      if (i) want.push({ t: SERIAL_STYLE.separator, fill: SERIAL_STYLE.fill });
+      const again = seen.has(e.serial);
+      seen.add(e.serial);
+      want.push({ t: e.serial, fill: again ? repeat : SERIAL_STYLE.fill });
+    });
+
+    const kids = [...text.children];
+    want.forEach((seg, i) => {
+      let n = kids[i];
+      if (!n || n.tagName !== 'tspan') {
+        n = document.createElementNS(SVG_NS, 'tspan');
+        if (kids[i]) text.replaceChild(n, kids[i]); else text.appendChild(n);
+      }
+      setText(n, seg.t);
+      setAttr(n, 'fill', seg.fill);
+    });
+    [...text.children].slice(want.length).forEach((n) => n.remove());
+    // Any bare text left over from an earlier version of this script.
+    [...text.childNodes].forEach((n) => { if (n.nodeType === 3) n.remove(); });
+
+    return want.map((seg) => seg.t).join('');
+  }
+
   // Draws the plates. Returns cat -> right edge, so the totals can dodge them.
-  function placeSerials(a, cats, metrics) {
+  function placeSerials(a, cats, metrics, takts) {
     const edges = new Map();
     if (!SERIAL_OVERLAY || !a.root) return edges;
 
@@ -534,11 +568,20 @@
     const wanted = [];
     const S = SERIAL_STYLE;
     const half = S.fontSize / 2;
+    // Serials already seen further up the axis: their next appearance is a
+    // repeat. Walked in axis order, so "first" means topmost on the chart.
+    const seen = new Set();
 
     cats.forEach((cat, i) => {
       const span = spans.get(cat);
+      const entries = (serials.get(cat) || []).filter((e) => e.serial);
       const label = serialText(serials.get(cat));
-      if (!span || !label) return;
+      if (!span || !label) {
+        // Still count them: a station whose stripe isn't drawn yet shouldn't
+        // make the station below it look like the first appearance.
+        entries.forEach((e) => seen.add(e.serial));
+        return;
+      }
 
       let g = existing.get(cat);
       let rect, text;
@@ -564,8 +607,8 @@
         text = g.querySelector('text');
       }
 
-      setText(text, label);
-      const w = textWidth(text, label);
+      const shown = paintSerials(text, entries, seen);
+      const w = textWidth(text, shown);
       const centre = metrics.top + i * metrics.step + metrics.height / 2;
 
       // Centred on the striped segment, then nudged back inside the canvas if
@@ -573,7 +616,15 @@
       let cx = (span.x0 + span.x1) / 2;
       if (S.clamp) {
         const room = w / 2 + S.padX;
-        const maxX = a.svgW - a.outerX - 1;   // right edge of the drawable area
+        // Hold back the room this row's takt time (and its thumb) will need,
+        // so a plate on a long bar slides left off its stripe rather than
+        // squatting on the space the number has to occupy.
+        const info = takts && takts.get(cat);
+        const reserve = info
+          ? estimateWidth(info.text) + BAND.valueGap +
+            thumbCount(info) * (ONTIME_ICON.gap + ONTIME_ICON.size)
+          : 0;
+        const maxX = a.svgW - a.outerX - 1 - reserve;
         const minX = S.clampLeftToPlot ? 1 : -a.outerX + 1;
         if (cx + room > maxX) cx = maxX - room;
         if (cx - room < minX) cx = minX + room;
@@ -806,11 +857,11 @@
 
     // 3. Serial-number plates over the striped tips. Drawn before the totals
     //    are placed so a total can be moved clear of its plate.
-    const plates = placeSerials(a, full, metrics);
+    const takts = TAKT_TOTALS ? taktByStation() : null;
+    const plates = placeSerials(a, full, metrics, takts);
 
     // 4. Per-bar end labels live outside the rows, so move them too.
-    placeTotals(a, full, desired, metrics,
-      TAKT_TOTALS ? taktByStation() : null,
+    placeTotals(a, full, desired, metrics, takts,
       TOTALS_AT_VISIBLE_END ? visibleEnds(a) : null,
       NUDGE_TOTALS_PAST_SERIALS ? plates : null);
 
@@ -836,28 +887,23 @@
     return out;
   }
 
-  // One thumbs-up per on-time unit, sitting just after that unit's takt time.
+  // The thumb only means anything when a station has exactly one unit on it.
+  // Two units share one takt label, so a single mark can't say which is on
+  // time — in that case the row gets no thumb at all.
+  function thumbCount(info) {
+    if (!ONTIME_ICON.enabled || !info || info.units.length !== 1) return 0;
+    return info.units[0].onTime ? 1 : 0;
+  }
+
+  // The thumbs-up, sitting just after the station's takt time.
   function placeThumbs(a, cat, labelNode, label, labelX, centre, info) {
     const layer = overlayLayers(a).ontime;
     let g = layer.querySelector(`:scope > g[data-tm-ontime-cat="${cssEscape(cat)}"]`);
-    const units = (ONTIME_ICON.enabled && info && info.units) || [];
     const marks = [];
 
-    if (units.some((u) => u.onTime)) {
-      // Walk the label string, unit by unit, tracking where each one ends.
-      const sep = SERIAL_STYLE.separator;
-      const measure = (chars) => prefixWidth(
-        labelNode || { textContent: label }, label, chars);
-      let chars = 0;
-      let shift = 0; // room already taken by thumbs drawn further left
-      units.forEach((u, i) => {
-        chars += u.takt.length;
-        if (u.onTime) {
-          marks.push(measure(chars) + shift + ONTIME_ICON.gap);
-          shift += ONTIME_ICON.gap + ONTIME_ICON.size;
-        }
-        if (i < units.length - 1) chars += sep.length;
-      });
+    if (thumbCount(info)) {
+      const w = labelNode ? textWidth(labelNode, label) : estimateWidth(label);
+      marks.push(w + ONTIME_ICON.gap);
     }
 
     if (!marks.length) {
@@ -950,7 +996,7 @@
       // stations in TAKT_EXCLUDE never get one at all.
       const info = takts ? takts.get(cat) : null;
       const takt = takts ? (info ? info.text : '') : null;
-      const thumbs = (info && info.units.filter((u) => u.onTime).length) || 0;
+      const thumbs = thumbCount(info);
       const reserve = thumbs * (ONTIME_ICON.gap + ONTIME_ICON.size);
       let t = real.get(cat);
 
