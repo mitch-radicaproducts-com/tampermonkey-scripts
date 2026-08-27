@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Airtable — Restyle "Production Numbers" chart from "Palette" chart
 // @namespace    radicaproducts.com
-// @version      4.0.1
-// @description  Reads the "Palette" chart once per page load — its rows, their order and their colors are the single source of truth — then holds the "Production Numbers" chart to that axis all day: missing workstations become 0 rows, existing bar lengths are never touched, Done segments take their workstation color, In-Progress tails become diagonal stripes in the workstation's own colour — or in the colour of the station that first claimed the serial, when the same unit is clocked in at several stations — overlaid with the serial numbers currently on that station, the "Hidden" padding segments are painted out, and the end of each bar carries that station's takt time, with a thumbs-up after it when a single on-time unit is on that station.
+// @version      4.3.0
+// @description  Reads the "Palette" chart once per page load — its rows, their order and their colors are the single source of truth — then holds the "Production Numbers" chart to that axis all day: missing workstations become 0 rows, existing bar lengths are never touched, Done segments take their workstation color, In-Progress tails become diagonal stripes coloured by unit — a unit takes the colour of the station that first claimed its serial, so a unit clocked in at several stations keeps one colour all the way across — and are split into one block per unit in table order, with that unit's serial centred on its block, the "Hidden" padding segments are painted out, and the end of each bar carries that station's takt time, with a thumbs-up after it when a single on-time unit is on that station.
 // @author       Mitch
 // @match        https://airtable.com/*
 // @run-at       document-idle
@@ -67,7 +67,8 @@
     padX: 3,               // px of plate either side of the text
     padY: 2,
     radius: 2,
-    sort: true,            // sort serials so the string is stable day to day
+    sort: false,           // true = A-Z; false = the table's own row order,
+                           //   so the last row lands on the tail-end block
     separator: ', ',
     clamp: true,           // keep long strings from running off the canvas
     clampLeftToPlot: true, // ...and out of the y-axis label gutter on the left
@@ -412,13 +413,16 @@
         serial: EMPTY_CELL.test(serial) ? '' : serial,
         takt: EMPTY_CELL.test(takt) ? '' : takt,
         onTime,
+        row: parseInt(row.getAttribute('aria-rowindex') || '0', 10) || 0,
       });
     });
 
-    if (SERIAL_STYLE.sort) {
-      found.forEach((list) => list.sort(
-        (a, b) => a.serial.localeCompare(b.serial, undefined, { numeric: true })));
-    }
+    // Table order by default: the row's own index, not the order the DOM
+    // happens to hold virtualised rows in. So the bottom row of the table is
+    // the block at the tail end of the bar.
+    found.forEach((list) => list.sort(SERIAL_STYLE.sort
+      ? (a, b) => a.serial.localeCompare(b.serial, undefined, { numeric: true })
+      : (a, b) => a.row - b.row));
 
     serialCache = found;
     return serialCache;
@@ -465,6 +469,19 @@
     return estimateWidth(s);
   }
 
+  // Width of a station's takt label as the browser will actually draw it.
+  // placeSerials needs the same number placeTotals will use, otherwise a plate
+  // yields too little room and the label lands on top of it; the estimate is
+  // only a first-pass fallback and converges once the label exists.
+  function taktWidth(a, cat, text) {
+    if (a.totals) {
+      const node = [...a.totals.querySelectorAll('text')]
+        .find((t) => parseLabel(t).category === cat && t.textContent === text);
+      if (node) return textWidth(node, text);
+    }
+    return estimateWidth(text);
+  }
+
   // Width of the first `chars` characters of the node's own text: where inside
   // a label a given unit's takt time ends.
   function prefixWidth(node, s, chars) {
@@ -478,7 +495,22 @@
     return estimateWidth(s.slice(0, chars));
   }
 
-  // x span of each row's striped In-Progress segment(s), in plot coordinates.
+  // Total vertical offset between a bar and the plot group. Vega nests several
+  // translate(0,y) groups between the two, so they have to be added up: taking
+  // the first one found lands on an inner translate(0,0) and the shape ends up
+  // at the top of the chart.
+  function rowTransform(a, el) {
+    let y = 0;
+    for (let n = el.parentElement; n && n !== a.root; n = n.parentElement) {
+      const t = n.getAttribute && n.getAttribute('transform');
+      const m = t && /^translate\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)/.exec(t);
+      if (m) y += parseFloat(m[2]) || 0;
+    }
+    return `translate(0,${round(y)})`;
+  }
+
+  // x span of each row's striped In-Progress segment(s), in plot coordinates,
+  // plus the exact shapes so slices can be clipped to the bar's rounded end.
   function wipSpans(a) {
     const out = new Map();
     barsIn(a.chartEl).forEach((el) => {
@@ -487,39 +519,140 @@
       if (isHidden(el, series) || !isYellow(el, series)) return;
       const g = barGeom(el);
       if (!g || !(g.w > 0)) return;
-      const s = out.get(category) || { x0: Infinity, x1: -Infinity };
+      const s = out.get(category) || { x0: Infinity, x1: -Infinity, shapes: [] };
       s.x0 = Math.min(s.x0, g.x);
       s.x1 = Math.max(s.x1, g.x + g.w);
+      s.shapes.push({ d: el.getAttribute('d') || '', tf: rowTransform(a, el) });
       out.set(category, s);
     });
     return out;
   }
 
-  // Our two drawing layers, always the last children of the plot group so the
-  // bars Vega just redrew can't paint over them. Order: plates, then thumbs.
-  const OVERLAYS = ['data-tm-serials', 'data-tm-ontime'];
+  // Our drawing layers, kept immediately before Vega's end-label group so the
+  // stack reads bars, then our blocks and plates, then the takt times on top.
+  // Appending them at the very end instead would let a block paint over a takt
+  // time that had to be pulled back inside the canvas.
+  // Order among themselves: blocks, plates, thumbs.
+  const OVERLAYS = ['data-tm-wip', 'data-tm-serials', 'data-tm-ontime'];
   function overlayLayers(a) {
     const out = {};
+    // Vega's end labels are a sibling of the bar groups, one level below the
+    // plot group, so that's where we live too.
+    const anchor = a.totals && a.totals.parentElement ? a.totals : null;
+    const host = anchor ? anchor.parentElement : a.root;
+
     const nodes = OVERLAYS.map((attr) => {
-      let g = a.root.querySelector(`:scope > g[${attr}]`);
+      let g = host.querySelector(`:scope > g[${attr}]`) ||
+        a.root.querySelector(`:scope > g[${attr}]`);
       if (!g) {
         g = document.createElementNS(SVG_NS, 'g');
         g.setAttribute(attr, '1');
         g.setAttribute('aria-hidden', 'true');
-        a.root.appendChild(g);
+        // Decoration only: the real bars underneath keep their tooltips.
+        g.setAttribute('pointer-events', 'none');
+        host.insertBefore(g, anchor);
       }
       return g;
     });
-    // Reorder only when they aren't already the final children, in order.
-    const tail = [...a.root.children].slice(-nodes.length);
-    if (nodes.some((g, i) => tail[i] !== g)) nodes.forEach((g) => a.root.appendChild(g));
-    out.serials = nodes[0];
-    out.ontime = nodes[1];
+    // Reorder only when they aren't already sitting together just before the
+    // labels: writing every pass would fight Vega's own re-renders.
+    const placed = nodes.every((g, i) =>
+      g.parentElement === host && g.nextSibling === (nodes[i + 1] || anchor));
+    if (!placed) nodes.forEach((g) => host.insertBefore(g, anchor));
+    out.wip = nodes[0];
+    out.serials = nodes[1];
+    out.ontime = nodes[2];
     return out;
   }
 
-  // Draws the plates. Returns cat -> right edge, so the totals can dodge them.
-  function placeSerials(a, cats, metrics, takts) {
+  // Splits a station's In-Progress bar into one block per unit, in table order,
+  // each striped in its own unit's colour. Clipped to the real bar, so the
+  // rounded end and the exact extents stay Airtable's.
+  function ensureClip(a, cat, shapes) {
+    const id = `tm-wip-clip-${cat.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`;
+    let defs = a.svg.querySelector('defs');
+    if (!defs) {
+      defs = document.createElementNS(SVG_NS, 'defs');
+      a.svg.insertBefore(defs, a.svg.firstChild);
+    }
+    let clip = defs.querySelector(`#${id}`);
+    if (!clip) {
+      clip = document.createElementNS(SVG_NS, 'clipPath');
+      clip.setAttribute('id', id);
+      defs.appendChild(clip);
+    }
+    // Reconcile the copied shapes: bars move and resize all day.
+    while (clip.children.length > shapes.length) clip.lastChild.remove();
+    shapes.forEach((sh, i) => {
+      let path = clip.children[i];
+      if (!path) {
+        path = document.createElementNS(SVG_NS, 'path');
+        clip.appendChild(path);
+      }
+      setAttr(path, 'd', sh.d);
+      setAttr(path, 'transform', sh.tf);
+    });
+    return `url(#${id})`;
+  }
+
+  function placeWipSlices(a, cats, colors, metrics) {
+    if (!STRIPES || !a.root) return;
+    const serials = readSerials();
+    const spans = wipSpans(a);
+    const byserial = serialColors(cats, colors);
+    const layer = overlayLayers(a).wip;
+
+    const existing = new Map();
+    [...layer.children].forEach((g) => {
+      const key = g.dataset.tmWipCat;
+      if (key && !existing.has(key)) existing.set(key, g); else g.remove();
+    });
+
+    const wanted = [];
+    cats.forEach((cat, i) => {
+      const span = spans.get(cat);
+      const units = serials.get(cat) || [];
+      // One unit needs no split: the bar itself is already its colour.
+      if (!span || units.length < 2 || !(span.x1 > span.x0)) return;
+
+      let g = existing.get(cat);
+      if (!g) {
+        g = document.createElementNS(SVG_NS, 'g');
+        g.dataset.tmWipCat = cat;
+        layer.appendChild(g);
+      }
+      setAttr(g, 'clip-path', ensureClip(a, cat, span.shapes));
+
+      const w = (span.x1 - span.x0) / units.length;
+      const y = metrics.top + i * metrics.step;
+      while (g.children.length > units.length) g.lastChild.remove();
+      units.forEach((unit, k) => {
+        let rect = g.children[k];
+        if (!rect) {
+          rect = document.createElementNS(SVG_NS, 'rect');
+          g.appendChild(rect);
+        }
+        const color = (unit.serial && byserial.get(unit.serial)) ||
+          colors.get(cat) || STRIPE.base;
+        setAttr(rect, 'x', round(span.x0 + k * w));
+        setAttr(rect, 'y', round(y));
+        // A hair of overlap, so antialiasing can't leave a seam between blocks.
+        setAttr(rect, 'width', round(w + (k < units.length - 1 ? 0.5 : 0)));
+        setAttr(rect, 'height', round(metrics.height));
+        setAttr(rect, 'fill', ensureStripePattern(a.svg, color));
+      });
+      wanted.push(g);
+    });
+
+    [...layer.children].forEach((g) => { if (!wanted.includes(g)) g.remove(); });
+    wanted.forEach((g, i) => {
+      if (layer.children[i] !== g) layer.insertBefore(g, layer.children[i] || null);
+    });
+  }
+
+  // Draws the plates: one per unit, centred on that unit's block. Returns
+  // cat -> right edge, so the totals can dodge them.
+  function placeSerials(a, cats, metrics, takts, ends) {
     const edges = new Map();
     if (!SERIAL_OVERLAY || !a.root) return edges;
 
@@ -527,11 +660,12 @@
     const spans = wipSpans(a);
 
     const layer = overlayLayers(a).serials;
+    const KEY = (cat, k) => `${cat}\u0000${k}`;
 
     const existing = new Map();
     [...layer.children].forEach((g) => {
-      const cat = g.dataset.tmSerialCat;
-      if (cat && !existing.has(cat)) existing.set(cat, g); else g.remove();
+      const key = KEY(g.dataset.tmSerialCat, g.dataset.tmSerialUnit);
+      if (g.dataset.tmSerialCat && !existing.has(key)) existing.set(key, g); else g.remove();
     });
 
     const wanted = [];
@@ -540,64 +674,110 @@
 
     cats.forEach((cat, i) => {
       const span = spans.get(cat);
-      const label = serialText(serials.get(cat));
-      if (!span || !label) return;
+      const units = serials.get(cat) || [];
+      if (!span || !units.length) return;
 
-      let g = existing.get(cat);
-      let rect, text;
-      if (!g) {
-        g = document.createElementNS(SVG_NS, 'g');
-        g.dataset.tmSerialCat = cat;
-        rect = document.createElementNS(SVG_NS, 'rect');
-        text = document.createElementNS(SVG_NS, 'text');
-        text.setAttribute('text-anchor', 'middle');
-        text.setAttribute('font-size', `${S.fontSize}px`);
-        const tpl = a.totals && a.totals.querySelector('text');
-        const family = tpl && tpl.getAttribute('font-family');
-        if (family) text.setAttribute('font-family', family);
-        rect.setAttribute('fill', S.bg);
-        rect.setAttribute('fill-opacity', String(S.bgOpacity));
-        rect.setAttribute('rx', String(S.radius));
-        g.appendChild(rect);
-        g.appendChild(text);
-        layer.appendChild(g);
-      } else {
-        rect = g.querySelector('rect');
-        text = g.querySelector('text');
-      }
-
-      setText(text, label);
-      setAttr(text, 'fill', S.fill);
-      const w = textWidth(text, label);
+      const sliceW = (span.x1 - span.x0) / units.length;
       const centre = metrics.top + i * metrics.step + metrics.height / 2;
 
-      // Centred on the striped segment, then nudged back inside the canvas if
-      // the string is wider than the room available.
-      let cx = (span.x0 + span.x1) / 2;
+      // Pass one: node per unit, text set, width measured, wanted centre noted.
+      const items = [];
+      units.forEach((unit, k) => {
+        if (!unit.serial) return;
+        let g = existing.get(KEY(cat, k));
+        let rect, text;
+        if (!g) {
+          g = document.createElementNS(SVG_NS, 'g');
+          g.dataset.tmSerialCat = cat;
+          g.dataset.tmSerialUnit = String(k);
+          rect = document.createElementNS(SVG_NS, 'rect');
+          text = document.createElementNS(SVG_NS, 'text');
+          text.setAttribute('text-anchor', 'middle');
+          text.setAttribute('font-size', `${S.fontSize}px`);
+          const tpl = a.totals && a.totals.querySelector('text');
+          const family = tpl && tpl.getAttribute('font-family');
+          if (family) text.setAttribute('font-family', family);
+          rect.setAttribute('fill', S.bg);
+          rect.setAttribute('fill-opacity', String(S.bgOpacity));
+          rect.setAttribute('rx', String(S.radius));
+          g.appendChild(rect);
+          g.appendChild(text);
+          layer.appendChild(g);
+        } else {
+          rect = g.querySelector('rect');
+          text = g.querySelector('text');
+        }
+        setText(text, unit.serial);
+        setAttr(text, 'fill', S.fill);
+        items.push({
+          g, rect, text,
+          w: textWidth(text, unit.serial),
+          cx: span.x0 + (k + 0.5) * sliceW,
+        });
+      });
+      if (!items.length) return;
+
+      // Pass two: every plate wants its own block's centre, but plates are
+      // often wider than their block. Three sweeps, each moving only the plates
+      // that have to move, so a plate that already fits stays centred:
+      // left-to-right to separate overlaps, right-to-left to pull the run
+      // inside the canvas, then left-to-right again for the left edge. Order
+      // always survives — plate n stays left of plate n+1.
+      const gap = 1;
+      const room = (it) => it.w / 2 + S.padX;
+
+      let prev = -Infinity;
+      items.forEach((it) => {
+        if (it.cx - room(it) < prev + gap) it.cx = prev + gap + room(it);
+        prev = it.cx + room(it);
+      });
+
       if (S.clamp) {
-        const room = w / 2 + S.padX;
-        // Hold back the room this row's takt time (and its thumb) will need,
-        // so a plate on a long bar slides left off its stripe rather than
-        // squatting on the space the number has to occupy.
+        // Ceiling: where this row's takt time starts, which is just past the
+        // end of the bar. Reserving room for the whole label instead would drag
+        // every plate on the row left, off the block it belongs to, whenever
+        // the label was long enough to be pulled back inside the canvas.
+        const end = ends && ends.get(cat);
+        const edge = a.svgW - a.outerX - 1;
+        // Ceiling: where this row's takt time starts, which is normally just
+        // past the end of the bar. Reserving room for the whole label on every
+        // row would drag plates off the blocks they belong to, so we only fall
+        // back to that when the label is long enough to be pushed back inside
+        // the canvas — then the last plate has to yield or the number would be
+        // written across it.
         const info = takts && takts.get(cat);
-        const reserve = info
-          ? estimateWidth(info.text) + BAND.valueGap +
-            thumbCount(info) * (ONTIME_ICON.gap + ONTIME_ICON.size)
-          : 0;
-        const maxX = a.svgW - a.outerX - 1 - reserve;
-        const minX = S.clampLeftToPlot ? 1 : -a.outerX + 1;
-        if (cx + room > maxX) cx = maxX - room;
-        if (cx - room < minX) cx = minX + room;
+        let ceiling = end === undefined ? Infinity : end + BAND.valueGap;
+        if (info) {
+          const need = taktWidth(a, cat, info.text) +
+            thumbCount(info) * (ONTIME_ICON.gap + ONTIME_ICON.size) + 4;
+          if (ceiling + need > edge) ceiling = edge - need;
+        }
+        let limit = Math.min(edge, ceiling);
+        for (let k = items.length - 1; k >= 0; k--) {
+          const it = items[k];
+          if (it.cx + room(it) > limit) it.cx = limit - room(it);
+          limit = it.cx - room(it) - gap;
+        }
+        let floor = S.clampLeftToPlot ? 1 : -a.outerX + 1;
+        for (let k = 0; k < items.length; k++) {
+          const it = items[k];
+          if (it.cx - room(it) < floor) it.cx = floor + room(it);
+          floor = it.cx + room(it) + gap;
+        }
       }
 
-      setAttr(text, 'transform', `translate(${round(cx)},${round(centre + BAND.labelDy)})`);
-      setAttr(rect, 'x', round(cx - w / 2 - S.padX));
-      setAttr(rect, 'y', round(centre - half - S.padY));
-      setAttr(rect, 'width', round(w + S.padX * 2));
-      setAttr(rect, 'height', round(S.fontSize + S.padY * 2));
+      items.forEach((it) => {
+        setAttr(it.text, 'transform',
+          `translate(${round(it.cx)},${round(centre + BAND.labelDy)})`);
+        setAttr(it.rect, 'x', round(it.cx - it.w / 2 - S.padX));
+        setAttr(it.rect, 'y', round(centre - half - S.padY));
+        setAttr(it.rect, 'width', round(it.w + S.padX * 2));
+        setAttr(it.rect, 'height', round(S.fontSize + S.padY * 2));
+        wanted.push(it.g);
+      });
 
-      edges.set(cat, cx + w / 2 + S.padX);
-      wanted.push(g);
+      const last = items[items.length - 1];
+      edges.set(cat, last.cx + last.w / 2 + S.padX);
     });
 
     [...layer.children].forEach((g) => { if (!wanted.includes(g)) g.remove(); });
@@ -818,11 +998,13 @@
     // 3. Serial-number plates over the striped tips. Drawn before the totals
     //    are placed so a total can be moved clear of its plate.
     const takts = TAKT_TOTALS ? taktByStation() : null;
-    const plates = placeSerials(a, full, metrics, takts);
+    const ends = visibleEnds(a);
+    placeWipSlices(a, full, palette.colors, metrics);
+    const plates = placeSerials(a, full, metrics, takts, ends);
 
     // 4. Per-bar end labels live outside the rows, so move them too.
     placeTotals(a, full, desired, metrics, takts,
-      TOTALS_AT_VISIBLE_END ? visibleEnds(a) : null,
+      TOTALS_AT_VISIBLE_END ? ends : null,
       NUDGE_TOTALS_PAST_SERIALS ? plates : null);
 
     setAttr(a.yAxis.parentElement.closest('g.mark-group.role-axis') || a.yAxis,
@@ -861,24 +1043,26 @@
     return owner;
   }
 
-  // Stripe colour per station: its own workstation colour, or the colour of
-  // whichever station further up the axis already has claim on a serial here.
+  // Stripe colour per serial: the colour of the station that owns it. A serial
+  // in progress at only one station therefore takes that station's own colour,
+  // which is what makes a lone unit look native to the row it sits on.
+  function serialColors(cats, colors) {
+    const owner = serialOwners(cats);
+    const out = new Map();
+    owner.forEach((own, sn) => out.set(sn, colors.get(own) || STRIPE.base));
+    return out;
+  }
+
+  // Fallback colour for the whole In-Progress bar, used when it isn't split:
+  // the first unit's colour, or the station's own when it holds nothing.
   function stripeColors(cats, colors) {
     const serials = readSerials();
-    const owner = serialOwners(cats);
-    const rank = new Map(cats.map((c, i) => [c, i]));
+    const byserial = serialColors(cats, colors);
     const out = new Map();
-
     cats.forEach((cat) => {
-      let claim = null;
-      (serials.get(cat) || []).forEach((e) => {
-        const own = e.serial && owner.get(e.serial);
-        if (!own || own === cat) return;
-        // If two borrowed serials sit here, the topmost station wins.
-        if (claim === null || rank.get(own) < rank.get(claim)) claim = own;
-      });
-      const color = colors.get(claim || cat) || colors.get(cat) || STRIPE.base;
-      out.set(cat, color);
+      const first = (serials.get(cat) || []).find((e) => e.serial);
+      out.set(cat, (first && byserial.get(first.serial)) ||
+        colors.get(cat) || STRIPE.base);
     });
     return out;
   }
