@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Airtable — Restyle "Production Numbers" chart from "Palette" chart
 // @namespace    radicaproducts.com
-// @version      3.9.0
-// @description  Reads the "Palette" chart once per page load — its rows, their order and their colors are the single source of truth — then holds the "Production Numbers" chart to that axis all day: missing workstations become 0 rows, existing bar lengths are never touched, Done segments take their workstation color, In-Progress tips become diagonal stripes overlaid with the serial numbers currently on that station (green when that station is on time and holds the only instance of its serial, black otherwise), the "Hidden" padding segments are painted out, and the end of each bar carries that station's takt time, with a thumbs-up after it when a single on-time unit is on that station.
+// @version      4.0.1
+// @description  Reads the "Palette" chart once per page load — its rows, their order and their colors are the single source of truth — then holds the "Production Numbers" chart to that axis all day: missing workstations become 0 rows, existing bar lengths are never touched, Done segments take their workstation color, In-Progress tails become diagonal stripes in the workstation's own colour — or in the colour of the station that first claimed the serial, when the same unit is clocked in at several stations — overlaid with the serial numbers currently on that station, the "Hidden" padding segments are painted out, and the end of each bar carries that station's takt time, with a thumbs-up after it when a single on-time unit is on that station.
 // @author       Mitch
 // @match        https://airtable.com/*
 // @run-at       document-idle
@@ -46,7 +46,6 @@
     ontime: 'On Time',          // checkbox: green thumb = true, white = false
   };
   // Workstations that get no takt time and no thumb, whatever the table says.
-  // Their stripes are always drawn in the 'good' colour.
   const TAKT_EXCLUDE = ['GOAL'];
   // The on-time mark. Drawn with Airtable's own thumbs-up sprite, so it is the
   // same glyph the table shows; the href is read off the table at runtime.
@@ -92,16 +91,16 @@
   const YELLOW_FILLS = ['rgb(255, 214, 107)'];
   const YELLOW_SERIES = ['In-Progress', 'In Progress'];
 
-  // Diagonal stripe pattern for the yellow tips. Two variants: 'good' for a
-  // station that is on time with the only instance of its serial, 'plain' for
-  // everything else.
+  // Diagonal stripes for the In-Progress tails. One pattern per colour, built
+  // on demand: a tail is striped in its own workstation's colour, unless the
+  // serial on it was already claimed by a station further up the axis, in
+  // which case it borrows that station's colour instead.
   const STRIPE = {
     id: 'tm-inprogress-stripes',
-    base: '#000000',            // plain: not on time, or the serial is at more than one station
-    good: 'rgb(4, 138, 14)',    // the thumbs-up green
+    base: '#000000',            // fallback when a station has no palette colour
     stripe: '#ffffff',          // white
     period: 6,                  // px: one coloured + one white band
-    width: 5,                   // px of white per period
+    width: 2,                   // px of white per period
     angle: 55,                  // degrees
   };
 
@@ -538,9 +537,6 @@
     const wanted = [];
     const S = SERIAL_STYLE;
     const half = S.fontSize / 2;
-    // Same rule as the stripes: green when this station is the only place that
-    // serial is clocked in and it's on time, otherwise the default text colour.
-    const green = goodStations();
 
     cats.forEach((cat, i) => {
       const span = spans.get(cat);
@@ -571,7 +567,7 @@
       }
 
       setText(text, label);
-      setAttr(text, 'fill', green.has(cat) ? STRIPE.good : S.fill);
+      setAttr(text, 'fill', S.fill);
       const w = textWidth(text, label);
       const centre = metrics.top + i * metrics.step + metrics.height / 2;
 
@@ -851,29 +847,38 @@
     return out;
   }
 
-  // A station earns the green treatment — green stripes, green serial — only
-  // when it has one unit on it, that unit is on time, and its serial isn't
-  // clocked in anywhere else. Anything less is plain: black on black. The
-  // stations in TAKT_EXCLUDE (GOAL) are always green.
-  function goodStations() {
-    const out = new Set(TAKT_EXCLUDE);
+  // Which station owns each serial: the first one it appears at, reading down
+  // the axis. A serial in progress at several stations is drawn everywhere in
+  // the owner's colour, so it reads as one unit moving through the shop.
+  function serialOwners(cats) {
     const serials = readSerials();
-
-    // How many stations each serial is in progress at right now.
-    const stations = new Map();
-    serials.forEach((list) => {
-      new Set((list || []).map((e) => e.serial)).forEach((sn) => {
-        stations.set(sn, (stations.get(sn) || 0) + 1);
+    const owner = new Map();
+    cats.forEach((cat) => {
+      (serials.get(cat) || []).forEach((e) => {
+        if (e.serial && !owner.has(e.serial)) owner.set(e.serial, cat);
       });
     });
+    return owner;
+  }
 
-    serials.forEach((list, cat) => {
-      if (TAKT_EXCLUDE.includes(cat)) return;
-      if (!list || list.length !== 1) return;      // two units: no thumb, no green
-      const unit = list[0];
-      if (!unit.onTime) return;                    // white thumb in the table
-      if ((stations.get(unit.serial) || 0) > 1) return; // also on another station
-      out.add(cat);
+  // Stripe colour per station: its own workstation colour, or the colour of
+  // whichever station further up the axis already has claim on a serial here.
+  function stripeColors(cats, colors) {
+    const serials = readSerials();
+    const owner = serialOwners(cats);
+    const rank = new Map(cats.map((c, i) => [c, i]));
+    const out = new Map();
+
+    cats.forEach((cat) => {
+      let claim = null;
+      (serials.get(cat) || []).forEach((e) => {
+        const own = e.serial && owner.get(e.serial);
+        if (!own || own === cat) return;
+        // If two borrowed serials sit here, the topmost station wins.
+        if (claim === null || rank.get(own) < rank.get(claim)) claim = own;
+      });
+      const color = colors.get(claim || cat) || colors.get(cat) || STRIPE.base;
+      out.set(cat, color);
     });
     return out;
   }
@@ -1079,10 +1084,11 @@
    * Stripe pattern
    * ================================================================== */
 
-  // variant: 'plain' (STRIPE.base) or 'good' (STRIPE.good).
-  function ensureStripePattern(svg, variant) {
+  // One pattern per colour, created once and reused.
+  function ensureStripePattern(svg, color) {
     if (!svg) return null;
-    const id = variant === 'good' ? `${STRIPE.id}-good` : STRIPE.id;
+    const fill = color || STRIPE.base;
+    const id = `${STRIPE.id}-${fill.replace(/[^a-z0-9]+/gi, '')}`;
     if (svg.querySelector(`#${id}`)) return `url(#${id})`;
 
     let defs = svg.querySelector('defs');
@@ -1100,7 +1106,7 @@
     const bg = document.createElementNS(SVG_NS, 'rect');
     bg.setAttribute('width', STRIPE.period);
     bg.setAttribute('height', STRIPE.period);
-    bg.setAttribute('fill', variant === 'good' ? STRIPE.good : STRIPE.base);
+    bg.setAttribute('fill', fill);
 
     const band = document.createElementNS(SVG_NS, 'rect');
     band.setAttribute('width', STRIPE.width);
@@ -1149,10 +1155,8 @@
     return out;
   }
 
-  function recolor(a, colors) {
-    const plain = STRIPES ? ensureStripePattern(a.svg, 'plain') : null;
-    const good = STRIPES ? ensureStripePattern(a.svg, 'good') : null;
-    const green = STRIPES ? goodStations() : null;
+  function recolor(a, colors, cats) {
+    const stripeColor = STRIPES ? stripeColors(cats, colors) : null;
 
     barsIn(a.chartEl).forEach((el) => {
       const { category, series } = parseLabel(el);
@@ -1168,7 +1172,10 @@
       if (orig === 'transparent' || orig === 'none') return; // placeholder row
 
       if (isYellow(el, series)) {
-        if (plain) setAttr(el, 'fill', green.has(category) ? good : plain);
+        if (stripeColor) {
+          const fill = ensureStripePattern(a.svg, stripeColor.get(category));
+          if (fill) setAttr(el, 'fill', fill);
+        }
         return;
       }
       if (!RECOLOR) return;
@@ -1199,7 +1206,7 @@
     applying = true;
     try {
       if (FIX_AXIS) fixAxis(target, p);
-      recolor(target, p.colors);
+      recolor(target, p.colors, p.order);
     } catch (e) {
       console.warn('[chart-restyle] failed:', e);
     } finally {
