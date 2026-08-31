@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Mission Control Chart - Layer 2.1 Recolor
+// @name         Mission Control Chart - Layer 2.1 - Recolor Bars
 // @namespace    radicaproducts.com
 // @version      1.0.0
 // @description  Recolors the Production Numbers chart from the frozen "Tampermonkey: Mission Control Recolor Palette" chart (Done = solid, In-Progress = 55deg white stripes) guarantees the chart always shows one row per palette workstation (synthesizing zero-value rows for stations with no data yet), and makes Hidden-status rows invisible while leaving them in the DOM.
