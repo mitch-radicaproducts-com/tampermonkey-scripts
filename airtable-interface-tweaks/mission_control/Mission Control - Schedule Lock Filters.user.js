@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Airtable Mission Control - Monday Meeting Patch
+// @name         Mission Control - Schedule Lock Filters
 // @namespace    radicaproducts.com
 // @version      1.2
 // @description  Keeps the Assembly Log and Defect Reports filters on "this calendar week" from Monday 8:30AM until Sunday midnight, and on their default (past 7 days) otherwise. Checks every 5 minutes without moving the page scroll.
