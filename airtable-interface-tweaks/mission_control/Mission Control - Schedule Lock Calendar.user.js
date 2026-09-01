@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Mission Control - Schedule Lock Calendar
 // @namespace    radicaproducts.com
-// @version      1.0.9
-// @description  Hides the calendar nav buttons and product-count footer, leaving a month heading in the top row. Holiday cells get the weekend fill and the holiday name under the date. Waits for the calendar to finish loading, then: Compact height, Custom 4-week, Hide weekends, Today + Previous week ×2 with 1s between steps. Hourly reset if the range has drifted.
+// @version      1.1.1
+// @description  First action is timescale → Custom → 4 weeks (Month view has no Previous week). Then Compact, Hide weekends, Today + Previous week ×2. Holiday names under the date, no gray fill. Hourly reset if the range has drifted.
 // @author       Mitch
 // @match        https://airtable.com/*
 // @run-at       document-idle
@@ -35,7 +35,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.0.9';
+  const VERSION = '1.1.1';
   const TICK_MS = 60 * 60 * 1000;
   const STEP_MS = 1000;
   const SETTLE_MS = 2000;
@@ -459,6 +459,14 @@
     el.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
+  function pressEnter(el) {
+    const target = el || document.activeElement || document;
+    const opts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
+    target.dispatchEvent(new KeyboardEvent('keydown', opts));
+    target.dispatchEvent(new KeyboardEvent('keypress', opts));
+    target.dispatchEvent(new KeyboardEvent('keyup', opts));
+  }
+
   async function pickFrom(openBtn, itemRe) {
     if (!openBtn) return false;
     tap(openBtn);
@@ -470,27 +478,72 @@
     return true;
   }
 
+  function timescaleLabel() {
+    const btn = buttons.timescale();
+    return btn ? (btn.textContent || '').replace(/\s+/g, ' ').trim() : '';
+  }
+
+  function isFourWeekTimescale() {
+    const t = timescaleLabel();
+    return /4\s*week/i.test(t) && !/month/i.test(t);
+  }
+
   async function setTimescaleCustom4() {
     const btn = buttons.timescale();
     if (!btn) return false;
     tap(btn);
-    const custom = await waitFor(() => labelled(/^custom\b/i));
-    if (!custom) { dismiss(); return false; }
-    tap(custom);
-    const input = await waitFor(() =>
-      [...document.querySelectorAll('input')].find((i) => {
-        if (!visible(i) || i.closest('[' + HIDE_ATTR + ']')) return false;
-        return i.type === 'number' || i.inputMode === 'numeric' || /^\d*$/.test(i.value);
-      })
-    );
-    if (input && input.value !== '4') setInput(input, '4');
-    const weeks = labelled(/^\s*weeks?\s*$/i) || labelled(/\bweeks?\b/i);
-    if (weeks && !chosen(weeks)) tap(weeks);
-    const apply = labelled(/^(apply|done|ok|save)$/i);
-    if (apply) tap(apply);
-    else dismiss();
     await sleep(STEP_MS);
-    return true;
+    const custom = await waitFor(() => labelled(/^custom\b/i) || labelled(/custom/i));
+    if (custom) {
+      tap(custom);
+      say('Custom clicked, waiting 1000ms for the dialog');
+      await sleep(1000);
+      const input = await waitFor(() =>
+        [...document.querySelectorAll('input')].find((i) => {
+          if (!visible(i) || i.closest('[' + HIDE_ATTR + ']')) return false;
+          return i.type === 'number' || i.inputMode === 'numeric' || /^\d*$/.test(i.value);
+        })
+      );
+      if (input) {
+        input.focus();
+        if (input.value !== '4') setInput(input, '4');
+        const weeks = labelled(/^\s*weeks?\s*$/i) || labelled(/\bweeks?\b/i);
+        if (weeks && !chosen(weeks)) tap(weeks);
+        pressEnter(input);
+      } else {
+        pressEnter(document.activeElement);
+      }
+      await sleep(STEP_MS);
+      return true;
+    }
+    const four = labelled(/^4\s*weeks?$/i) || labelled(/4\s*week/i);
+    if (four) {
+      tap(four);
+      await sleep(STEP_MS);
+      return true;
+    }
+    dismiss();
+    return false;
+  }
+
+  // Month view only has Previous/Next month. Previous week does not exist
+  // until the timescale is a week-based custom range. This must run first.
+  async function ensureTimescaleCustom4() {
+    if (isFourWeekTimescale() && buttons.prevWeek()) {
+      say('timescale already', timescaleLabel());
+      return true;
+    }
+    say('setting Custom 4 weeks; now=', timescaleLabel() || '(none)');
+    for (let i = 0; i < 4; i++) {
+      await setTimescaleCustom4();
+      await sleep(STEP_MS);
+      if (isFourWeekTimescale() || buttons.prevWeek()) {
+        say('timescale ok', timescaleLabel());
+        return true;
+      }
+    }
+    say('timescale still', timescaleLabel() || '(none)', 'prevWeek=' + !!buttons.prevWeek());
+    return !!(isFourWeekTimescale() || buttons.prevWeek());
   }
 
   async function enableHideWeekends() {
@@ -510,15 +563,16 @@
   }
 
   async function setupOnce() {
-    // Height is only offered on a 2-week+ timescale; set that first.
-    await setTimescaleCustom4();
+    // Timescale first. Month view has no Previous week; every later
+    // click depends on Custom 4 weeks being in place.
+    await ensureTimescaleCustom4();
     await sleep(STEP_MS);
     await enableHideWeekends();
     await sleep(STEP_MS);
     await setHeightCompact();
     await sleep(STEP_MS);
     dismissHoverChrome();
-    log('setup done');
+    say('setup done', 'timescale=' + timescaleLabel());
   }
 
   /* ------------------------------------------------------------------ */
@@ -526,7 +580,10 @@
   /* ------------------------------------------------------------------ */
 
   function parseRange(text) {
-    const m = String(text || '').match(
+    const raw = String(text || '').replace(/\s+/g, ' ').trim();
+    // Month-mode heading is just "August 2026" — not a date range.
+    if (/^[A-Za-z]{3,9}\s+\d{4}$/.test(raw)) return null;
+    const m = raw.match(
       /([A-Za-z]{3,9})\s+(\d{1,2})(?:\s*,\s*(\d{4}))?\s*[-–—]\s*([A-Za-z]{3,9})?\s*(\d{1,2})(?:\s*,\s*(\d{4}))?/
     );
     if (!m) return null;
@@ -660,10 +717,10 @@
       const name = HOLIDAY_NAMES.get(ymd(date)) || '';
       if (name) {
         setAttr(cell, 'data-tm-holiday', '1');
-        if (!cell.classList.contains(WEEKEND_BG)) {
-          setAttr(cell, 'data-tm-holiday-paint', '1');
-          dropClass(cell, WEEKDAY_BG);
-          addClass(cell, WEEKEND_BG);
+        if (cell.getAttribute('data-tm-holiday-paint') === '1') {
+          dropClass(cell, WEEKEND_BG);
+          addClass(cell, WEEKDAY_BG);
+          dropAttr(cell, 'data-tm-holiday-paint');
         }
         writeHolidayLabel(cell, name);
       } else {
@@ -773,6 +830,15 @@
     const wasHidden = !!(nav && nav.getAttribute(HIDE_ATTR) === 'nav');
     if (wasHidden) dropAttr(nav, HIDE_ATTR);
     try {
+      if (!buttons.prevWeek() || /month/i.test(timescaleLabel())) {
+        say('Month (or no Previous week) — setting Custom 4 weeks first');
+        await ensureTimescaleCustom4();
+        await sleep(STEP_MS);
+      }
+      if (!buttons.prevWeek()) {
+        say('still no Previous week after timescale; not navigating');
+        return false;
+      }
       await navClick(() => buttons.today(), 'Today');
       await navClick(() => buttons.prevWeek(), 'Previous week');
       await navClick(() => buttons.prevWeek(), 'Previous week');
@@ -937,5 +1003,7 @@
     if (++tries > 120 || setupState !== 'pending') clearInterval(poll);
   }, 500);
 
+  say('script loaded', location.pathname);
+  window.addEventListener('load', () => schedule());
   schedule();
 })();
