@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Mission Control Chart - Layer 2.2 Serials In-Progress
+// @name         Mission Control Chart - Layer 2.2 - Serials In-Progress
 // @namespace    radicaproducts.com
-// @version      1.0.0
+// @version      1.0.1
 // @description  Overlays serial numbers from the "Tampermonkey: Serial Numbers In-Progress" table onto the In-Progress bar segments of the Production Numbers chart, and appends that row's Takt Time (plus a green thumbs-up when On Time) into the first empty cell after the bar. Uses only the Layer 1 grid harness, so stripes/fills/colors are irrelevant.
 // @author       Mitch
 // @match        https://airtable.com/*
