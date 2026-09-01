@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mission Control - Schedule Lock Calendar
 // @namespace    radicaproducts.com
-// @version      1.0.8
+// @version      1.0.9
 // @description  Hides the calendar nav buttons and product-count footer, leaving a month heading in the top row. Holiday cells get the weekend fill and the holiday name under the date. Waits for the calendar to finish loading, then: Compact height, Custom 4-week, Hide weekends, Today + Previous week ×2 with 1s between steps. Hourly reset if the range has drifted.
 // @author       Mitch
 // @match        https://airtable.com/*
@@ -35,7 +35,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.0.8';
+  const VERSION = '1.0.9';
   const TICK_MS = 60 * 60 * 1000;
   const STEP_MS = 1000;
   const SETTLE_MS = 2000;
@@ -58,7 +58,8 @@
   ];
 
   const DEBUG = false;
-  const log = (...a) => DEBUG && console.log('[cal-chrome]', ...a);
+  const log = (...a) => DEBUG && console.log('[schedule-lock]', ...a);
+  const say = (...a) => console.info('[schedule-lock]', VERSION, ...a);
 
   /* ------------------------------------------------------------------ */
   /* Idempotent writes                                                  */
@@ -201,7 +202,10 @@
   /* DOM                                                                */
   /* ------------------------------------------------------------------ */
 
-  const calendar = () => document.querySelector('[data-testid="page-element:calendar"]');
+  const calendar = () =>
+    document.querySelector('[data-testid="page-element:calendar"]') ||
+    document.querySelector('[data-elementtype="calendar"]') ||
+    document.querySelector('[data-testid="calendar-month-view-dates-container"]');
 
   function visible(el) {
     if (!el) return false;
@@ -236,13 +240,19 @@
     prevWeek: () => {
       const root = calendar();
       if (!root) return null;
-      return [...root.querySelectorAll('button')].find((b) => {
-        const spoken = (
-          (b.getAttribute('aria-label') || '') + ' ' +
-          (b.getAttribute('aria-description') || '')
-        ).replace(/\s+/g, ' ').trim();
-        return /previous week/i.test(spoken) && !/(?:4|\d+) weeks/i.test(spoken);
-      }) || null;
+      const all = [...root.querySelectorAll('button')];
+      const spokenOf = (b) => buttonText(b);
+      const byLabel = all.find((b) =>
+        /previous week/i.test(spokenOf(b)) && !/(?:4|\d+) weeks/i.test(spokenOf(b))
+      );
+      if (byLabel) return byLabel;
+      const nextIdx = all.findIndex((b) =>
+        /next week/i.test(spokenOf(b)) && !/(?:4|\d+) weeks/i.test(spokenOf(b))
+      );
+      if (nextIdx > 0) return all[nextIdx - 1];
+      const prev4 = all.findIndex((b) => /previous (?:4|\d+) weeks/i.test(spokenOf(b)));
+      if (prev4 >= 0 && all[prev4 + 1]) return all[prev4 + 1];
+      return null;
     },
     nextWeek: () => toolbarButton(/next week/i),
     prevPeriod: () => toolbarButton(/previous 4 weeks|previous \d+ weeks/i),
@@ -741,7 +751,7 @@
     const before = rangeKey();
     const btn = await waitFor(getBtn, CLICK_WAIT_MS);
     if (!btn) {
-      log('favoriteView: ' + label + ' button not found');
+      say(label + ' button not found');
       return false;
     }
     tap(btn);
@@ -813,25 +823,32 @@
   let setupState = 'pending'; // pending | running | navigating | done
   let ticking = false;
 
+  // Calendar + Today is enough to start. Do not require Previous week, a
+  // parseable range, or date cells — those were never appearing on the
+  // meeting-room machine, so the old ready check sat for 60s doing nothing.
+  // Also never wait on window "load": Airtable SPAs can miss that event.
   function isCalendarReady() {
-    if (document.readyState !== 'complete') return false;
-    const root = calendar();
-    if (!root) return false;
-    if (!buttons.today() || !buttons.prevWeek()) return false;
-    if (!dateCells(root).length) return false;
-    return !!currentRange();
+    return !!(calendar() && buttons.today());
   }
 
   async function waitUntilReady() {
-    if (document.readyState !== 'complete') {
-      await new Promise((resolve) => {
-        if (document.readyState === 'complete') resolve();
-        else window.addEventListener('load', resolve, { once: true });
-      });
+    say('waiting', 'readyState=' + document.readyState);
+    const t0 = Date.now();
+    while (document.readyState !== 'complete' && Date.now() - t0 < 15000) {
+      await sleep(200);
     }
-    await waitFor(isCalendarReady, 60000);
+    const found = await waitFor(isCalendarReady, 90000);
+    const root = calendar();
+    say(
+      'ready?', !!found,
+      'doc=' + document.readyState,
+      'today=' + !!buttons.today(),
+      'prevWeek=' + !!buttons.prevWeek(),
+      'cells=' + (root ? dateCells(root).length : 0),
+      'range=' + (rangeTitle() || '(none)')
+    );
     await sleep(SETTLE_MS);
-    return isCalendarReady();
+    return !!found;
   }
 
   function apply() {
@@ -854,19 +871,27 @@
     if (setupState !== 'pending') return;
     setupState = 'running';
     try {
-      await waitUntilReady();
+      const ready = await waitUntilReady();
+      if (!ready) say('starting anyway — calendar not fully seen');
       await setupOnce();
       await sleep(STEP_MS);
+      await waitFor(() => buttons.prevWeek(), 15000);
       setupState = 'navigating';
       await favoriteView();
+      if (!isFavoriteView()) {
+        say('favorite view missed, retrying once');
+        await sleep(STEP_MS);
+        await favoriteView();
+      }
       await sleep(STEP_MS);
       hideChrome();
       dismissHoverChrome();
       paintHolidays();
       markFavoriteState();
       window.__TM_CAL__ = buildApi();
+      say('boot done', 'favorite=' + isFavoriteView());
     } catch (e) {
-      console.warn('[cal-chrome] setup failed:', e);
+      console.warn('[schedule-lock] setup failed:', e);
     }
     setupState = 'done';
     if (!ticking) {
