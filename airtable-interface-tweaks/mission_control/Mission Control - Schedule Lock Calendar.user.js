@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Mission Control - Schedule Lock Calendar
 // @namespace    radicaproducts.com
-// @version      1.0.7
-// @description  Hides the calendar nav buttons and product-count footer, leaving a month heading in the top row. Holiday cells get the weekend fill and the holiday name under the date. At start: Compact height, Custom 4-week timescale, Hide weekends. Every hour, favoriteView() runs only if the range is not already two weeks back from this week.
+// @version      1.0.8
+// @description  Hides the calendar nav buttons and product-count footer, leaving a month heading in the top row. Holiday cells get the weekend fill and the holiday name under the date. Waits for the calendar to finish loading, then: Compact height, Custom 4-week, Hide weekends, Today + Previous week ×2 with 1s between steps. Hourly reset if the range has drifted.
 // @author       Mitch
 // @match        https://airtable.com/*
 // @run-at       document-idle
@@ -35,9 +35,11 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.0.7';
+  const VERSION = '1.0.8';
   const TICK_MS = 60 * 60 * 1000;
-  const NAV_GAP_MS = 250;
+  const STEP_MS = 1000;
+  const SETTLE_MS = 2000;
+  const CLICK_WAIT_MS = 3000;
   const HIDE_TOOLBAR = true;
   const HIDE_FOOTER = true;
   const HIDE_ATTR = 'data-tm-cal-hide';
@@ -234,9 +236,13 @@
     prevWeek: () => {
       const root = calendar();
       if (!root) return null;
-      return [...root.querySelectorAll('button')].find((b) =>
-        /^(?:tooltip:\s*)?previous week$/i.test((b.getAttribute('aria-label') || '').trim())
-      ) || toolbarButton(/^previous week$/i);
+      return [...root.querySelectorAll('button')].find((b) => {
+        const spoken = (
+          (b.getAttribute('aria-label') || '') + ' ' +
+          (b.getAttribute('aria-description') || '')
+        ).replace(/\s+/g, ' ').trim();
+        return /previous week/i.test(spoken) && !/(?:4|\d+) weeks/i.test(spoken);
+      }) || null;
     },
     nextWeek: () => toolbarButton(/next week/i),
     prevPeriod: () => toolbarButton(/previous 4 weeks|previous \d+ weeks/i),
@@ -326,7 +332,9 @@
   function applyMonthHeading() {
     const el = titleEl();
     if (!el) return;
-    const heading = monthHeading(currentRange());
+    const range = currentRange();
+    if (range) rememberRange(range);
+    const heading = monthHeading(range);
     if (heading) setText(el, heading);
   }
 
@@ -357,7 +365,7 @@
 
   async function waitFor(fn, ms) {
     const t0 = Date.now();
-    const limit = ms == null ? 2000 : ms;
+    const limit = ms == null ? CLICK_WAIT_MS : ms;
     while (Date.now() - t0 < limit) {
       const v = fn();
       if (v) return v;
@@ -448,7 +456,7 @@
     if (!item) { dismiss(); return false; }
     if (!chosen(item)) tap(item);
     else dismiss();
-    await sleep(80);
+    await sleep(STEP_MS);
     return true;
   }
 
@@ -471,7 +479,7 @@
     const apply = labelled(/^(apply|done|ok|save)$/i);
     if (apply) tap(apply);
     else dismiss();
-    await sleep(120);
+    await sleep(STEP_MS);
     return true;
   }
 
@@ -483,7 +491,7 @@
     if (!item) { dismiss(); return false; }
     if (!chosen(item)) tap(item);
     else dismiss();
-    await sleep(80);
+    await sleep(STEP_MS);
     return true;
   }
 
@@ -494,8 +502,11 @@
   async function setupOnce() {
     // Height is only offered on a 2-week+ timescale; set that first.
     await setTimescaleCustom4();
+    await sleep(STEP_MS);
     await enableHideWeekends();
+    await sleep(STEP_MS);
     await setHeightCompact();
+    await sleep(STEP_MS);
     dismissHoverChrome();
     log('setup done');
   }
@@ -524,23 +535,48 @@
     return { start: start, end: end };
   }
 
-  function currentRange() {
-    const root = calendar();
-    if (!root) return null;
-    const titled = root.querySelector('.huge[title], [title*="-"]');
-    const fromTitle = titled && parseRange(titled.getAttribute('title') || '');
-    if (fromTitle) return fromTitle;
-    const huge = root.querySelector('.huge');
-    return huge ? parseRange(huge.textContent) : null;
+  function parseYmd(s) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s || '');
+    if (!m) return null;
+    const d = new Date(+m[1], +m[2] - 1, +m[3]);
+    d.setHours(0, 0, 0, 0);
+    return d;
   }
 
-  function rangeStart(root) {
-    const titled = root.querySelector('.huge[title], [title*="-"]');
-    const fromTitle = titled && parseRange(titled.getAttribute('title') || '');
-    if (fromTitle) return fromTitle.start;
-    const huge = root.querySelector('.huge');
-    const parsed = huge ? parseRange(huge.textContent) : null;
-    return parsed ? parsed.start : null;
+  function rememberRange(range) {
+    const el = titleEl();
+    if (!el || !range || !range.start) return;
+    setAttr(el, 'data-tm-range', ymd(range.start) + '/' + (range.end ? ymd(range.end) : ''));
+  }
+
+  function rangeFromMemo() {
+    const el = titleEl();
+    const memo = el && el.getAttribute('data-tm-range');
+    if (!memo) return null;
+    const parts = memo.split('/');
+    const start = parseYmd(parts[0]);
+    if (!start) return null;
+    return { start: start, end: parseYmd(parts[1]) };
+  }
+
+  function currentRange() {
+    const el = titleEl();
+    const fromTitle = el && parseRange(el.getAttribute('title') || '');
+    if (fromTitle && fromTitle.start) {
+      rememberRange(fromTitle);
+      return fromTitle;
+    }
+    const fromText = el && parseRange(el.textContent || '');
+    if (fromText && fromText.start) {
+      rememberRange(fromText);
+      return fromText;
+    }
+    return rangeFromMemo();
+  }
+
+  function rangeStart() {
+    const r = currentRange();
+    return r ? r.start : null;
   }
 
   function weekdayHeaders(root) {
@@ -639,10 +675,17 @@
   /* ------------------------------------------------------------------ */
 
   function rangeTitle() {
-    const root = calendar();
-    if (!root) return '';
-    const el = root.querySelector('.huge[title], .huge');
-    return el ? (el.getAttribute('title') || el.textContent || '').trim() : '';
+    const el = titleEl();
+    if (!el) return '';
+    const title = (el.getAttribute('title') || '').trim();
+    if (parseRange(title)) return title;
+    return (el.textContent || '').trim();
+  }
+
+  function rangeKey() {
+    const r = currentRange();
+    if (r && r.start) return ymd(r.start) + ':' + (r.end ? ymd(r.end) : '');
+    return rangeTitle();
   }
 
   function addDays(d, n) {
@@ -694,28 +737,39 @@
   // *then* step back two weeks. The three clicks must not share a turn —
   // if they do, React keeps the last navigation (Previous week) and the
   // calendar walks backwards forever.
+  async function navClick(getBtn, label) {
+    const before = rangeKey();
+    const btn = await waitFor(getBtn, CLICK_WAIT_MS);
+    if (!btn) {
+      log('favoriteView: ' + label + ' button not found');
+      return false;
+    }
+    tap(btn);
+    await waitFor(() => {
+      const now = rangeKey();
+      return now && now !== before;
+    }, CLICK_WAIT_MS);
+    await sleep(STEP_MS);
+    return true;
+  }
+
   async function favoriteView() {
     markFavoriteState();
     if (isFavoriteView()) {
       log('already on favorite view');
       return true;
     }
-    const todayBtn = buttons.today();
-    if (!todayBtn) {
-      log('favoriteView: Today button not found');
-      return false;
+    const nav = navControls();
+    const wasHidden = !!(nav && nav.getAttribute(HIDE_ATTR) === 'nav');
+    if (wasHidden) dropAttr(nav, HIDE_ATTR);
+    try {
+      await navClick(() => buttons.today(), 'Today');
+      await navClick(() => buttons.prevWeek(), 'Previous week');
+      await navClick(() => buttons.prevWeek(), 'Previous week');
+    } finally {
+      if (wasHidden && nav) setAttr(nav, HIDE_ATTR, 'nav');
+      markFavoriteState();
     }
-    const before = rangeTitle();
-    tap(todayBtn);
-    await waitFor(() => {
-      const now = rangeTitle();
-      return now && now !== before;
-    }, 800);
-    await sleep(NAV_GAP_MS);
-    tap(buttons.prevWeek());
-    await sleep(NAV_GAP_MS);
-    tap(buttons.prevWeek());
-    markFavoriteState();
     return true;
   }
 
@@ -756,8 +810,29 @@
   /* ------------------------------------------------------------------ */
 
   let applying = false;
-  let setupState = 'pending'; // pending | running | done
+  let setupState = 'pending'; // pending | running | navigating | done
   let ticking = false;
+
+  function isCalendarReady() {
+    if (document.readyState !== 'complete') return false;
+    const root = calendar();
+    if (!root) return false;
+    if (!buttons.today() || !buttons.prevWeek()) return false;
+    if (!dateCells(root).length) return false;
+    return !!currentRange();
+  }
+
+  async function waitUntilReady() {
+    if (document.readyState !== 'complete') {
+      await new Promise((resolve) => {
+        if (document.readyState === 'complete') resolve();
+        else window.addEventListener('load', resolve, { once: true });
+      });
+    }
+    await waitFor(isCalendarReady, 60000);
+    await sleep(SETTLE_MS);
+    return isCalendarReady();
+  }
 
   function apply() {
     if (applying || !calendar()) return;
@@ -776,19 +851,24 @@
   }
 
   async function boot() {
-    if (setupState !== 'pending' || !calendar()) return;
+    if (setupState !== 'pending') return;
     setupState = 'running';
     try {
+      await waitUntilReady();
       await setupOnce();
+      await sleep(STEP_MS);
+      setupState = 'navigating';
+      await favoriteView();
+      await sleep(STEP_MS);
+      hideChrome();
+      dismissHoverChrome();
+      paintHolidays();
+      markFavoriteState();
+      window.__TM_CAL__ = buildApi();
     } catch (e) {
       console.warn('[cal-chrome] setup failed:', e);
     }
     setupState = 'done';
-    hideChrome();
-    dismissHoverChrome();
-    paintHolidays();
-    markFavoriteState();
-    window.__TM_CAL__ = buildApi();
     if (!ticking) {
       ticking = true;
       let inFlight = false;
@@ -801,7 +881,6 @@
           inFlight = false;
         }
       }
-      runFavoriteView();
       setInterval(runFavoriteView, TICK_MS);
     }
   }
@@ -816,7 +895,7 @@
       timer = null;
       last = Date.now();
       apply();
-      if (setupState === 'pending' && calendar()) boot();
+      if (setupState === 'pending') boot();
     }, Math.max(80, MIN_GAP - (Date.now() - last)));
   }
 
@@ -830,7 +909,7 @@
   let tries = 0;
   const poll = setInterval(() => {
     schedule();
-    if (++tries > 60 || calendar()) clearInterval(poll);
+    if (++tries > 120 || setupState !== 'pending') clearInterval(poll);
   }, 500);
 
   schedule();
