@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Mission Control - Schedule Lock Calendar
 // @namespace    radicaproducts.com
-// @version      1.1.1
-// @description  First action is timescale → Custom → 4 weeks (Month view has no Previous week). Then Compact, Hide weekends, Today + Previous week ×2. Holiday names under the date, no gray fill. Hourly reset if the range has drifted.
+// @version      1.2.0
+// @description  First action is timescale → Custom → 4 weeks (Month view has no Previous week). Then Compact, Hide weekends, Today + Previous week ×2. Holiday names come from the Tampermonkey: Visible Holidays table (frozen on load). Hourly reset if the range has drifted.
 // @author       Mitch
 // @match        https://airtable.com/*
 // @run-at       document-idle
@@ -30,12 +30,17 @@
  * isFavoriteView() can still parse it. Collapse the footer. Never
  * display:none / remove(), so button.click() still works. Compare-then-write
  * so the observer cannot loop.
+ *
+ * Holidays come from the Interface table labeled
+ * "Tampermonkey: Visible Holidays" (Holiday Name + Holiday Date). The
+ * first complete read is Object.freeze()'d; later table edits are ignored
+ * until reload. Names are written under the date number. No cell fill.
  * ====================================================================== */
 
 (function () {
   'use strict';
 
-  const VERSION = '1.1.1';
+  const VERSION = '1.2.0';
   const TICK_MS = 60 * 60 * 1000;
   const STEP_MS = 1000;
   const SETTLE_MS = 2000;
@@ -113,7 +118,7 @@
   }
 
   /* ------------------------------------------------------------------ */
-  /* Holidays: US federal, next 90 days (actual + observed)             */
+  /* Holidays: one snapshot from "Tampermonkey: Visible Holidays"       */
   /* ------------------------------------------------------------------ */
 
   function ymd(d) {
@@ -123,80 +128,116 @@
     return y + '-' + m + '-' + day;
   }
 
-  function nthDow(year, month, dow, n) {
-    const d = new Date(year, month, 1);
-    let seen = 0;
-    while (d.getMonth() === month) {
-      if (d.getDay() === dow && ++seen === n) return new Date(d);
-      d.setDate(d.getDate() + 1);
+  // Airtable levels cells use "September 1, 2026". Also accept ISO and
+  // numeric forms so a column-format change does not empty the snapshot.
+  function parseHolidayDate(text) {
+    const raw = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!raw) return null;
+    let m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(raw);
+    if (m) {
+      const d = new Date(+m[1], +m[2] - 1, +m[3]);
+      d.setHours(0, 0, 0, 0);
+      return d.getFullYear() === +m[1] && d.getMonth() === +m[2] - 1 && d.getDate() === +m[3]
+        ? d
+        : null;
+    }
+    m = /^([A-Za-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})$/.exec(raw);
+    if (m) {
+      const month = MONTHS[m[1].toLowerCase()];
+      if (month == null) return null;
+      const d = new Date(+m[3], month, +m[2]);
+      d.setHours(0, 0, 0, 0);
+      return d;
+    }
+    m = /^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/.exec(raw);
+    if (m) {
+      const d = new Date(+m[3], +m[1] - 1, +m[2]);
+      d.setHours(0, 0, 0, 0);
+      return d;
     }
     return null;
   }
 
-  function lastDow(year, month, dow) {
-    const d = new Date(year, month + 1, 0);
-    while (d.getDay() !== dow) d.setDate(d.getDate() - 1);
-    return d;
+  function holidaysTable() {
+    const labels = document.querySelectorAll(
+      '[data-testid="page-element-label"], [data-testid="page-element-label"] span'
+    );
+    for (let i = 0; i < labels.length; i++) {
+      const text = (labels[i].textContent || '').replace(/\s+/g, ' ').trim();
+      if (!/^tampermonkey:\s*visible holidays$/i.test(text)) continue;
+      return labels[i].closest('[data-testid="page-element:levels"]') ||
+        labels[i].closest('[data-elementtype="levels"]');
+    }
+    return null;
   }
 
-  function observed(d) {
-    const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-    if (x.getDay() === 6) x.setDate(x.getDate() - 1);
-    else if (x.getDay() === 0) x.setDate(x.getDate() + 1);
-    return x;
-  }
-
-  function federalYear(year) {
-    const out = [];
-    const add = (name, d, shift) => {
-      if (!d) return;
-      out.push({ name: name, date: new Date(d) });
-      if (shift) {
-        const o = observed(d);
-        if (ymd(o) !== ymd(d)) out.push({ name: name + ' (observed)', date: o });
+  function readHolidayRows() {
+    const table = holidaysTable();
+    if (!table) return null;
+    const rows = table.querySelectorAll('[data-testid="level-row-clickable"]');
+    const dict = Object.create(null);
+    rows.forEach((row) => {
+      let date = null;
+      const nodes = row.querySelectorAll('div, span');
+      for (let i = 0; i < nodes.length; i++) {
+        const t = (nodes[i].textContent || '').replace(/\s+/g, ' ').trim();
+        const parsed = parseHolidayDate(t);
+        if (parsed) {
+          date = parsed;
+          break;
+        }
       }
-    };
-    add("New Year's Day", new Date(year, 0, 1), true);
-    add('Martin Luther King Jr. Day', nthDow(year, 0, 1, 3));
-    add("Presidents' Day", nthDow(year, 1, 1, 3));
-    add('Memorial Day', lastDow(year, 4, 1));
-    add('Juneteenth', new Date(year, 5, 19), true);
-    add('Independence Day', new Date(year, 6, 4), true);
-    add('Labor Day', nthDow(year, 8, 1, 1));
-    add('Columbus Day', nthDow(year, 9, 1, 2));
-    add('Veterans Day', new Date(year, 10, 11), true);
-    add('Thanksgiving', nthDow(year, 10, 4, 4));
-    add('Christmas Day', new Date(year, 11, 25), true);
-    return out;
-  }
-
-  function holidaysNext90() {
-    const start = new Date();
-    start.setHours(0, 0, 0, 0);
-    const end = new Date(start);
-    end.setDate(end.getDate() + 90);
-    const seen = new Set();
-    const out = [];
-    [start.getFullYear(), end.getFullYear()].forEach((year) => {
-      federalYear(year).forEach((h) => {
-        const key = ymd(h.date);
-        if (seen.has(key)) return;
-        if (h.date < start || h.date > end) return;
-        seen.add(key);
-        out.push({ name: h.name, date: h.date, key: key });
-      });
+      const titles = [...row.querySelectorAll('[title]')]
+        .map((el) => (el.getAttribute('title') || '').trim())
+        .filter((t) => t && !parseHolidayDate(t));
+      let name = titles[0] || '';
+      if (!name) {
+        const cells = row.querySelectorAll('[data-testid="row-column-container"]');
+        for (let i = 0; i < cells.length; i++) {
+          const t = (cells[i].textContent || '').replace(/\s+/g, ' ').trim();
+          if (t && !parseHolidayDate(t)) {
+            name = t;
+            break;
+          }
+        }
+      }
+      if (name && date) {
+        const key = ymd(date);
+        if (!dict[key]) dict[key] = name;
+      }
     });
-    out.sort((a, b) => a.date - b.date);
-    return out;
+    const grid = table.querySelector('[role="treegrid"][aria-rowcount]');
+    const expected = grid ? parseInt(grid.getAttribute('aria-rowcount'), 10) : NaN;
+    const count = Object.keys(dict).length;
+    if (!grid) return count ? dict : null;
+    if (expected > 0 && count < expected) return null;
+    return dict;
   }
 
-  const HOLIDAYS = holidaysNext90();
-  const HOLIDAY_NAMES = new Map();
-  HOLIDAYS.forEach((h) => {
-    const prev = HOLIDAY_NAMES.get(h.key);
-    HOLIDAY_NAMES.set(h.key, prev && prev !== h.name ? prev + ' / ' + h.name : h.name);
-  });
-  log('holidays', HOLIDAYS.map((h) => h.key + ' ' + h.name));
+  // Frozen after the first complete read. Later table edits are ignored
+  // until the page is reloaded.
+  let HOLIDAYS_FROZEN = null;
+
+  function commitHolidays(dict) {
+    if (HOLIDAYS_FROZEN) return HOLIDAYS_FROZEN;
+    if (!dict) return null;
+    HOLIDAYS_FROZEN = Object.freeze(Object.assign(Object.create(null), dict));
+    const keys = Object.keys(HOLIDAYS_FROZEN).sort();
+    say('holidays frozen', keys.length
+      ? keys.map((k) => k + ' ' + HOLIDAYS_FROZEN[k]).join(', ')
+      : '(empty table)');
+    return HOLIDAYS_FROZEN;
+  }
+
+  function tryCommitHolidays() {
+    if (HOLIDAYS_FROZEN) return HOLIDAYS_FROZEN;
+    if (!holidaysTable()) return null;
+    return commitHolidays(readHolidayRows());
+  }
+
+  function holidayNameFor(date) {
+    return (HOLIDAYS_FROZEN && HOLIDAYS_FROZEN[ymd(date)]) || '';
+  }
 
   /* ------------------------------------------------------------------ */
   /* DOM                                                                */
@@ -714,7 +755,7 @@
     if (!start || !cells.length) return;
     const mapped = datesForCells(start, cells, weekdayHeaders(root));
     mapped.forEach(({ cell, date }) => {
-      const name = HOLIDAY_NAMES.get(ymd(date)) || '';
+      const name = holidayNameFor(date);
       if (name) {
         setAttr(cell, 'data-tm-holiday', '1');
         if (cell.getAttribute('data-tm-holiday-paint') === '1') {
@@ -856,7 +897,9 @@
   function buildApi() {
     return {
       version: VERSION,
-      holidays: () => HOLIDAYS.map((h) => ({ name: h.name, date: ymd(h.date) })),
+      holidays: () => HOLIDAYS_FROZEN
+        ? Object.keys(HOLIDAYS_FROZEN).sort().map((k) => ({ name: HOLIDAYS_FROZEN[k], date: k }))
+        : [],
       calendar: calendar,
       buttons: buttons,
       click: {
@@ -924,6 +967,7 @@
     if (setupState !== 'done') return;
     applying = true;
     try {
+      tryCommitHolidays();
       hideChrome();
       paintHolidays();
       markFavoriteState();
@@ -939,6 +983,8 @@
     try {
       const ready = await waitUntilReady();
       if (!ready) say('starting anyway — calendar not fully seen');
+      const holidays = await waitFor(() => tryCommitHolidays(), 20000);
+      if (!holidays) say('Visible Holidays table not frozen yet');
       await setupOnce();
       await sleep(STEP_MS);
       await waitFor(() => buttons.prevWeek(), 15000);
