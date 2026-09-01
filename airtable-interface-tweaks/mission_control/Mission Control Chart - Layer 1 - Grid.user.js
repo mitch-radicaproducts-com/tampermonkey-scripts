@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Mission Control Chart - Layer 1
+// @name         Mission Control Chart - Layer 1 - Grid
 // @namespace    radicaproducts.com
-// @version      1.0.0
+// @version      1.0.1
 // @description  Layer 1 of 2. Lays an addressable grid of fixed-width cells over the Vega bar chart Airtable renders, names every cell A01..Z99, writes the Done count over the last Done cell of each row, and exposes window.__TM_GRID__ so a layer 2 script can recolour, pattern and label any cell by name. Changes nothing else about the chart.
 // @author       Mitch
 // @match        https://airtable.com/*
