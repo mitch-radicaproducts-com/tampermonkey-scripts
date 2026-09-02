@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Mission Control - Schedule Lock Calendar
 // @namespace    radicaproducts.com
-// @version      1.2.0
-// @description  First action is timescale → Custom → 4 weeks (Month view has no Previous week). Then Compact, Hide weekends, Today + Previous week ×2. Holiday names come from the Tampermonkey: Visible Holidays table (frozen on load). Hourly reset if the range has drifted.
+// @version      1.2.1
+// @description  First action is timescale → Custom → 4 weeks (Month view has no Previous week). Then Compact, Hide weekends, Today + Previous week ×2. Holiday names from the Visible Holidays table. Weekend-gray fill on holidays and Fridays. Hourly reset if the range has drifted.
 // @author       Mitch
 // @match        https://airtable.com/*
 // @run-at       document-idle
@@ -34,13 +34,14 @@
  * Holidays come from the Interface table labeled
  * "Tampermonkey: Visible Holidays" (Holiday Name + Holiday Date). The
  * first complete read is Object.freeze()'d; later table edits are ignored
- * until reload. Names are written under the date number. No cell fill.
+ * until reload. Names are written under the date number. Holiday and
+ * Friday cells use the same colors-background-subtler fill as weekends.
  * ====================================================================== */
 
 (function () {
   'use strict';
 
-  const VERSION = '1.2.0';
+  const VERSION = '1.2.1';
   const TICK_MS = 60 * 60 * 1000;
   const STEP_MS = 1000;
   const SETTLE_MS = 2000;
@@ -747,6 +748,23 @@
     if (size && label.style.fontSize !== size) label.style.fontSize = size;
   }
 
+  function paintWeekendFill(cell, gray) {
+    if (gray) {
+      dropClass(cell, WEEKDAY_BG);
+      addClass(cell, WEEKEND_BG);
+      setAttr(cell, 'data-tm-weekend-paint', '1');
+      return;
+    }
+    if (cell.getAttribute('data-tm-weekend-paint') !== '1' &&
+        cell.getAttribute('data-tm-holiday-paint') !== '1') {
+      return;
+    }
+    dropClass(cell, WEEKEND_BG);
+    addClass(cell, WEEKDAY_BG);
+    dropAttr(cell, 'data-tm-weekend-paint');
+    dropAttr(cell, 'data-tm-holiday-paint');
+  }
+
   function paintHolidays() {
     const root = calendar();
     if (!root) return;
@@ -756,25 +774,17 @@
     const mapped = datesForCells(start, cells, weekdayHeaders(root));
     mapped.forEach(({ cell, date }) => {
       const name = holidayNameFor(date);
+      const friday = date.getDay() === 5;
+      paintWeekendFill(cell, !!(name || friday));
       if (name) {
         setAttr(cell, 'data-tm-holiday', '1');
-        if (cell.getAttribute('data-tm-holiday-paint') === '1') {
-          dropClass(cell, WEEKEND_BG);
-          addClass(cell, WEEKDAY_BG);
-          dropAttr(cell, 'data-tm-holiday-paint');
-        }
         writeHolidayLabel(cell, name);
       } else {
-        if (cell.getAttribute('data-tm-holiday') === '1') {
-          if (cell.getAttribute('data-tm-holiday-paint') === '1') {
-            dropClass(cell, WEEKEND_BG);
-            addClass(cell, WEEKDAY_BG);
-            dropAttr(cell, 'data-tm-holiday-paint');
-          }
-          dropAttr(cell, 'data-tm-holiday');
-        }
+        dropAttr(cell, 'data-tm-holiday');
         writeHolidayLabel(cell, '');
       }
+      if (friday) setAttr(cell, 'data-tm-friday', '1');
+      else dropAttr(cell, 'data-tm-friday');
     });
   }
 
