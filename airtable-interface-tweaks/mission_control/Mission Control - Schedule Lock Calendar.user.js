@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Mission Control - Schedule Lock Calendar
 // @namespace    radicaproducts.com
-// @version      1.2.1
-// @description  First action is timescale → Custom → 4 weeks (Month view has no Previous week). Then Compact, Hide weekends, Today + Previous week ×2. Holiday names from the Visible Holidays table. Weekend-gray fill on holidays and Fridays. Hourly reset if the range has drifted.
+// @version      1.2.2
+// @description  First action is timescale → Custom → 4 weeks (Month view has no Previous week). Then Compact, Hide weekends, Today + Previous week ×2. Holiday names from the Visible Holidays table. Weekend-gray fill on holidays and Fridays. Blue today badge follows the real local date. Hourly reset if the range has drifted.
 // @author       Mitch
 // @match        https://airtable.com/*
 // @run-at       document-idle
@@ -36,13 +36,16 @@
  * first complete read is Object.freeze()'d; later table edits are ignored
  * until reload. Names are written under the date number. Holiday and
  * Friday cells use the same colors-background-subtler fill as weekends.
+ * The blue today badge on .right is kept on the real local date — Airtable
+ * leaves it on the load-day once we mutate the cells.
  * ====================================================================== */
 
 (function () {
   'use strict';
 
-  const VERSION = '1.2.1';
+  const VERSION = '1.2.2';
   const TICK_MS = 60 * 60 * 1000;
+  const DAY_WATCH_MS = 60 * 1000;
   const STEP_MS = 1000;
   const SETTLE_MS = 2000;
   const CLICK_WAIT_MS = 3000;
@@ -51,6 +54,9 @@
   const HIDE_ATTR = 'data-tm-cal-hide';
   const WEEKEND_BG = 'colors-background-subtler';
   const WEEKDAY_BG = 'colors-background-default';
+  const TODAY_BG = 'colors-background-primary-control';
+  const TODAY_FG = 'text-white';
+  const TODAY_SHAPE = 'rounded-big';
   const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   const MONTHS = {
     jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2,
@@ -724,6 +730,31 @@
     return out;
   }
 
+  function startOfToday() {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d;
+  }
+
+  function dateNumberEl(cell) {
+    const host = cell.firstElementChild || cell;
+    return host.querySelector('.right') || null;
+  }
+
+  function paintTodayBadge(num, on) {
+    if (!num) return;
+    if (on) {
+      addClass(num, TODAY_SHAPE);
+      addClass(num, TODAY_BG);
+      addClass(num, TODAY_FG);
+      return;
+    }
+    if (!num.classList.contains(TODAY_BG)) return;
+    dropClass(num, TODAY_BG);
+    dropClass(num, TODAY_FG);
+    dropClass(num, TODAY_SHAPE);
+  }
+
   function holidayLabel(cell) {
     return cell.querySelector('[data-tm-holiday-label]');
   }
@@ -772,10 +803,13 @@
     const cells = dateCells(root);
     if (!start || !cells.length) return;
     const mapped = datesForCells(start, cells, weekdayHeaders(root));
+    const todayKey = ymd(startOfToday());
     mapped.forEach(({ cell, date }) => {
       const name = holidayNameFor(date);
       const friday = date.getDay() === 5;
+      const isToday = ymd(date) === todayKey;
       paintWeekendFill(cell, !!(name || friday));
+      paintTodayBadge(dateNumberEl(cell), isToday);
       if (name) {
         setAttr(cell, 'data-tm-holiday', '1');
         writeHolidayLabel(cell, name);
@@ -785,6 +819,8 @@
       }
       if (friday) setAttr(cell, 'data-tm-friday', '1');
       else dropAttr(cell, 'data-tm-friday');
+      if (isToday) setAttr(cell, 'data-tm-today', '1');
+      else dropAttr(cell, 'data-tm-today');
     });
   }
 
@@ -1019,16 +1055,29 @@
     if (!ticking) {
       ticking = true;
       let inFlight = false;
+      let paintedTodayKey = ymd(startOfToday());
       async function runFavoriteView() {
         if (inFlight) return;
         inFlight = true;
         try {
           await favoriteView();
+          apply();
         } finally {
           inFlight = false;
         }
       }
+      function watchCalendarDay() {
+        const key = ymd(startOfToday());
+        if (key === paintedTodayKey) return;
+        paintedTodayKey = key;
+        say('calendar day rolled to', key);
+        apply();
+      }
       setInterval(runFavoriteView, TICK_MS);
+      setInterval(watchCalendarDay, DAY_WATCH_MS);
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) watchCalendarDay();
+      });
     }
   }
 
