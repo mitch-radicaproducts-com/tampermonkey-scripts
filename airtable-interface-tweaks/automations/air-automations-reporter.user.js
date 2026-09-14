@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Airtable Automations Reporter - Crawler
+// @name         air-automations-reporter
 // @namespace    air-automations-reporter
-// @version      1.5.0
+// @version      1.5.1
 // @description  Crawl Airtable Automations tabs and POST monthly run counts to Google Apps Script.
 // @match        https://airtable.com/apptmE8EpK6ku4mjM/*
 // @match        https://airtable.com/appyNKedN0QzytZkd/*
@@ -23,7 +23,13 @@
     { id: "apptmE8EpK6ku4mjM", url: "https://airtable.com/apptmE8EpK6ku4mjM/automations" },
     { id: "appyNKedN0QzytZkd", url: "https://airtable.com/appyNKedN0QzytZkd/automations" },
   ];
-  const INTERVAL_MS = 30 * 60 * 1000;
+  const SCAN_WEEKDAYS = [1, 2, 3, 4];
+  const SCAN_TIMES = [
+    { hour: 7, minute: 55 },
+    { hour: 12, minute: 25 },
+    { hour: 16, minute: 15 },
+  ];
+  const CRAWL_WINDOW_MS = 90 * 60 * 1000;
   const WEBHOOK_URL = "";
   const WEBHOOK_TOKEN = "airtable-runs-demo";
   const AUTO_START = true;
@@ -283,11 +289,27 @@
 
   function formatClock(ts) {
     if (!ts) return "—";
-    return new Date(ts).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    const when = new Date(ts);
+    const time = when.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    if (when.toDateString() === new Date().toDateString()) return time;
+    return `${when.toLocaleDateString([], { weekday: "short" })} ${time}`;
+  }
+
+  function nextScheduledScanAt(fromMs) {
+    const from = new Date(fromMs);
+    for (let dayOffset = 0; dayOffset < 16; dayOffset += 1) {
+      const day = new Date(from.getFullYear(), from.getMonth(), from.getDate() + dayOffset);
+      if (!SCAN_WEEKDAYS.includes(day.getDay())) continue;
+      for (const time of SCAN_TIMES) {
+        const candidate = new Date(day.getFullYear(), day.getMonth(), day.getDate(), time.hour, time.minute, 0, 0);
+        if (candidate.getTime() > fromMs) return candidate.getTime();
+      }
+    }
+    return fromMs + 24 * 60 * 60 * 1000;
   }
 
   // Keep in sync with lib/schedule.js.
-  function planResume(crawl, now, intervalMs) {
+  function planResume(crawl, now) {
     if (!crawl.autoEnabled) {
       return {
         action: "idle",
@@ -307,13 +329,13 @@
     return {
       action: "wait",
       phase: "waiting",
-      nextScanAt: crawl.nextScanAt > now ? crawl.nextScanAt : now + intervalMs,
+      nextScanAt: crawl.nextScanAt > now ? crawl.nextScanAt : nextScheduledScanAt(now),
       continueUntil: 0,
     };
   }
 
-  function planAfterFinish(now, intervalMs) {
-    return { phase: "waiting", nextScanAt: now + intervalMs, continueUntil: 0 };
+  function planAfterFinish(now) {
+    return { phase: "waiting", nextScanAt: nextScheduledScanAt(now), continueUntil: 0 };
   }
 
   function planCycleStart(now, crawlWindowMs) {
@@ -554,7 +576,7 @@
     panel.id = PANEL_ID;
     panel.innerHTML = `
       <h1>air-automations-reporter</h1>
-      <p class="sub">Auto waits 30 minutes after this Automations tab is ready, then after each finished crawl. Crawl both now is immediate.</p>
+      <p class="sub">Auto runs at 7:55 AM, 12:25 PM, and 4:15 PM Monday–Thursday (local time). Crawl both now is immediate.</p>
       <div class="row">
         <button class="primary" type="button" data-action="crawl">Crawl both now</button>
         <button class="ghost" type="button" data-action="auto">Auto: …</button>
@@ -773,7 +795,7 @@
   async function finishCycle() {
     const published = await publishReport();
     const crawl = loadCrawl();
-    Object.assign(crawl, planAfterFinish(Date.now(), INTERVAL_MS));
+    Object.assign(crawl, planAfterFinish(Date.now()));
     if (!published.ok) crawl.lastError = published.reason || "webhook failed";
     saveCrawl(crawl);
     const log = loadWebhookLog();
@@ -791,7 +813,7 @@
     if (scanning) return;
     const crawl = loadCrawl();
     if (!force && !crawl.autoEnabled) return;
-    Object.assign(crawl, planCycleStart(Date.now(), INTERVAL_MS), { lastError: "" });
+    Object.assign(crawl, planCycleStart(Date.now(), CRAWL_WINDOW_MS), { lastError: "" });
     saveCrawl(crawl);
     renderPanel();
     await scanAndAdvance();
@@ -809,7 +831,7 @@
       return;
     }
     crawl.phase = "waiting";
-    crawl.nextScanAt = Date.now() + INTERVAL_MS;
+    crawl.nextScanAt = nextScheduledScanAt(Date.now());
     saveCrawl(crawl);
     scheduleWait();
     renderPanel();
@@ -826,7 +848,7 @@
 
   async function resumeCrawl() {
     const crawl = loadCrawl();
-    const plan = planResume(crawl, Date.now(), INTERVAL_MS);
+    const plan = planResume(crawl, Date.now());
 
     if (plan.action === "idle") {
       if (crawl.phase === "scanning" || crawl.continueUntil) {
