@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Mission Control Chart - Layer 2.3 - Buffer
 // @namespace    tm.mission-control.layer-2.3
-// @version      2.0.0
-// @description  Prefix Production Numbers Y-axis stations with BUF: N and a connector. Water Test and Board Foam are always BUF: ?.
+// @version      2.1.0
+// @description  Prefix Production Numbers Y-axis stations with BUF: N and a connector. Board Foam is always BUF: ?.
 // @match        https://airtable.com/*
 // @match        https://*.airtable.com/*
 // @run-at       document-idle
@@ -10,7 +10,7 @@
 // ==/UserScript==
 
 /**
- * Layer 2.3 — Buffer (v2.0.0)
+ * Layer 2.3 — Buffer (v2.1.0)
  *
  * Standalone userscript. Does not patch Layer 2.2 (Serials In-Progress).
  * Built from lib/buffer-logic.js + src/overlay.js via scripts/build-userscript.js.
@@ -18,14 +18,14 @@
  *   Welding (5)     →  BUF: 5 ── Panels
  *   Panels (5)      →  forked BUF: 5 between Trim 1 and Trim 2
  *   Trim 1 + Trim 2 →  BUF: N ── Seals
- *   Water Test      →  BUF: ? ── Water Test (always)
+ *   Finish          →  BUF: N ── Water Test
  *   Board Foam      →  BUF: ? ── Insulation - Board Foam (always)
  */
 
 (function () {
   "use strict";
 
-  const VERSION = "2.0.0";
+  const VERSION = "2.1.0";
 
 /**
  * Pure helpers for Mission Control Chart Layer 2.3 (Buffer).
@@ -56,7 +56,7 @@ const DISPLAY_OVERRIDES = {
   "trim 2": "seals",
 };
 
-const FORCED_UNKNOWN_STATIONS = ["water test", "insulation - board foam"];
+const FORCED_UNKNOWN_STATIONS = ["insulation - board foam"];
 const FORCED_UNKNOWN = new Set(FORCED_UNKNOWN_STATIONS);
 const FORK_DISPLAY_GROUPS = [["trim 1", "trim 2"]];
 
@@ -116,7 +116,7 @@ function mappedValueFor(mapped, name) {
 /**
  * Map each Buffer-table row onto the station that should show BUF: N.
  * Default: next Y-axis station. Trim 1 + Trim 2 sum onto Seals.
- * Water Test and Insulation - Board Foam are always "?".
+ * Insulation - Board Foam is always "?".
  */
 function mapBufferCountsToNextStations(bufferRows, axisStations) {
   const indexByKey = axisIndexByKey(axisStations);
