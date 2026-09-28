@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mission Control Chart - Layer 2.3 - Buffer
 // @namespace    tm.mission-control.layer-2.3
-// @version      2.1.0
+// @version      2.1.1
 // @description  Prefix Production Numbers Y-axis stations with BUF: N and a connector. Board Foam is always BUF: ?.
 // @match        https://airtable.com/*
 // @match        https://*.airtable.com/*
@@ -10,7 +10,7 @@
 // ==/UserScript==
 
 /**
- * Layer 2.3 — Buffer (v2.1.0)
+ * Layer 2.3 — Buffer (v2.1.1)
  *
  * Standalone userscript. Does not patch Layer 2.2 (Serials In-Progress).
  * Built from lib/buffer-logic.js + src/overlay.js via scripts/build-userscript.js.
@@ -25,7 +25,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "2.1.0";
+  const VERSION = "2.1.1";
 
 /**
  * Pure helpers for Mission Control Chart Layer 2.3 (Buffer).
@@ -34,6 +34,7 @@
 
 const DEFAULT_AXIS = [
   "GOAL",
+  "Cutting",
   "Welding",
   "Panels",
   "Trim 1",
