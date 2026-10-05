@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AT - Workstation Operator QOL Tweaks
 // @namespace    radicaproducts.com
-// @version      1.0.0
+// @version      1.1.0
 // @description  Workstation operator shortcuts for Airtable: = or + opens Add Entry, the build-sheet barcode field is focused and submitted with Enter, and the Omni button is a clock.
 // @author       Mitchell Sanchez
 // @match        https://airtable.com/*
@@ -313,13 +313,16 @@
     // comes back.
 
     function formatClock(date) {
+        const month = date.getMonth() + 1;
+        const day = date.getDate();
         let hours = date.getHours();
         const minutes = date.getMinutes();
         const suffix = hours >= 12 ? 'PM' : 'AM';
         hours = hours % 12 || 12;
-        const hh = hours < 10 ? '0' + hours : String(hours);
         const mm = minutes < 10 ? '0' + minutes : String(minutes);
-        return hh + ':' + mm + ' ' + suffix;
+        const md = (month < 10 ? '0' + month : String(month)) + '/' +
+            (day < 10 ? '0' + day : String(day));
+        return md + ' ' + hours + ':' + mm + suffix;
     }
 
     function omniTriggerFrom(node) {
