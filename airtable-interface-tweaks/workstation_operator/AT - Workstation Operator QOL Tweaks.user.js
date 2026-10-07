@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AT - Workstation Operator QOL Tweaks
 // @namespace    radicaproducts.com
-// @version      1.1.0
+// @version      1.2.0
 // @description  Workstation operator shortcuts for Airtable: = or + opens Add Entry, the build-sheet barcode field is focused and submitted with Enter, and the Omni button is a clock.
 // @author       Mitchell Sanchez
 // @match        https://airtable.com/*
@@ -338,6 +338,12 @@
         const root = trigger.closest('[aria-label="Omni"]');
         if (root) root.setAttribute('aria-label', 'Clock');
 
+        // Airtable pins this control to the bottom-right. Keep the 16px margin
+        // and park it on the top edge instead.
+        trigger.style.setProperty('top', '0', 'important');
+        trigger.style.setProperty('bottom', 'auto', 'important');
+        trigger.style.setProperty('right', '0', 'important');
+        trigger.style.setProperty('left', 'auto', 'important');
         trigger.style.setProperty('width', 'auto', 'important');
         trigger.style.setProperty('height', '40px', 'important');
         trigger.style.setProperty('min-width', '0', 'important');
