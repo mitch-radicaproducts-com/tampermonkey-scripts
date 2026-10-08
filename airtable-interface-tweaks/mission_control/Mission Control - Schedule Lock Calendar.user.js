@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Mission Control - Schedule Lock Calendar
 // @namespace    radicaproducts.com
-// @version      1.2.2
-// @description  First action is timescale → Custom → 4 weeks (Month view has no Previous week). Then Compact, Hide weekends, Today + Previous week ×2. Holiday names from the Visible Holidays table. Weekend-gray fill on holidays and Fridays. Blue today badge follows the real local date. Hourly reset if the range has drifted.
+// @version      1.2.3
+// @description  First action is timescale → Custom → 4 weeks (Month view has no Previous week). Then Compact, Hide weekends, Today + Previous week ×2. Holiday names from the Visible Holidays table. Weekend-gray fill on holidays and Fridays. Blue today badge follows the real local date. Hourly reset if the range has drifted. Auto-starts without a 4 Week click; ignores the live clock mole.
 // @author       Mitch
 // @match        https://airtable.com/*
 // @run-at       document-idle
@@ -38,12 +38,20 @@
  * Friday cells use the same colors-background-subtler fill as weekends.
  * The blue today badge on .right is kept on the real local date — Airtable
  * leaves it on the load-day once we mutate the cells.
+ *
+ * Auto-start must not wait on the live clock mole (aria-label="Clock",
+ * [data-at-clock]) in the upper right. That widget rewrites inline style
+ * every tick; a document-wide observer watching `style` never got a quiet
+ * turn, so boot only ran after a 4 Week click created real calendar
+ * mutations. Boot starts from the script itself. The observer ignores the
+ * clock and does not watch `style`. An empty Visible Holidays table is
+ * frozen immediately — it must not block taking control.
  * ====================================================================== */
 
 (function () {
   'use strict';
 
-  const VERSION = '1.2.2';
+  const VERSION = '1.2.3';
   const TICK_MS = 60 * 60 * 1000;
   const DAY_WATCH_MS = 60 * 1000;
   const STEP_MS = 1000;
@@ -216,7 +224,13 @@
     const grid = table.querySelector('[role="treegrid"][aria-rowcount]');
     const expected = grid ? parseInt(grid.getAttribute('aria-rowcount'), 10) : NaN;
     const count = Object.keys(dict).length;
-    if (!grid) return count ? dict : null;
+    if (!grid) {
+      // Empty illustration: "No holidays exist or match the current filters".
+      // Freeze {} so boot does not sit for 20s waiting on rows that will never come.
+      if (/no holidays exist/i.test(table.textContent || '')) return dict;
+      return count ? dict : null;
+    }
+    if (expected === 0) return dict;
     if (expected > 0 && count < expected) return null;
     return dict;
   }
@@ -433,12 +447,24 @@
   }
 
   function labelled(re) {
-    return [...document.querySelectorAll(
+    const root = calendar();
+    const nodes = [...document.querySelectorAll(
       'button, [role="menuitem"], [role="option"], [role="menuitemradio"], [role="menuitemcheckbox"], [role="switch"], label'
-    )].find((el) => {
+    )];
+    const match = (el) => {
       if (!visible(el) || el.closest('[' + HIDE_ATTR + ']')) return false;
       const text = ((el.getAttribute('aria-label') || '') + ' ' + (el.textContent || '')).replace(/\s+/g, ' ').trim();
       return re.test(text);
+    };
+    // Portals (timescale / height menus) land on document.body. Prefer those
+    // so "4 week" does not match the toolbar trigger and eat the click that
+    // was supposed to pick a menu item.
+    const portal = nodes.find((el) => match(el) && (!root || !root.contains(el)));
+    if (portal) return portal;
+    return nodes.find((el) => {
+      if (!match(el)) return false;
+      if (el === buttons.timescale() || el === buttons.height() || el === buttons.today()) return false;
+      return true;
     }) || null;
   }
 
@@ -1029,8 +1055,9 @@
     try {
       const ready = await waitUntilReady();
       if (!ready) say('starting anyway — calendar not fully seen');
-      const holidays = await waitFor(() => tryCommitHolidays(), 20000);
-      if (!holidays) say('Visible Holidays table not frozen yet');
+      // Take control first. An empty holidays table (or a slow table) must
+      // not hold the calendar until someone clicks 4 Week.
+      tryCommitHolidays();
       await setupOnce();
       await sleep(STEP_MS);
       await waitFor(() => buttons.prevWeek(), 15000);
@@ -1042,6 +1069,14 @@
         await favoriteView();
       }
       await sleep(STEP_MS);
+      if (!HOLIDAYS_FROZEN) {
+        const holidays = await waitFor(() => tryCommitHolidays(), 2500);
+        if (!holidays && holidaysTable()) {
+          commitHolidays(readHolidayRows() || Object.create(null));
+        } else if (!holidays) {
+          say('Visible Holidays table not frozen yet');
+        }
+      }
       hideChrome();
       dismissHoverChrome();
       paintHolidays();
@@ -1095,20 +1130,68 @@
     }, Math.max(80, MIN_GAP - (Date.now() - last)));
   }
 
-  new MutationObserver(() => schedule()).observe(document.documentElement, {
+  // The collab clock mole ([aria-label="Clock"], [data-at-clock]) rewrites
+  // inline style every tick. Do not observe `style`, and skip any mutation
+  // whose target is inside that widget. Do not change the clock itself.
+  function isClockNode(node) {
+    let el = node;
+    if (el && el.nodeType !== 1) el = el.parentElement;
+    if (!el || !el.closest) return false;
+    if (el.closest('[aria-label="Clock"]')) return true;
+    if (el.closest('[data-testid="collab-mole-trigger"]')) return true;
+    if (el.hasAttribute && el.hasAttribute('data-at-clock')) return true;
+    if (el.closest('[data-at-clock]')) return true;
+    return false;
+  }
+
+  function isIgnoredTarget(node) {
+    if (isClockNode(node)) return true;
+    let el = node;
+    if (el && el.nodeType !== 1) el = el.parentElement;
+    if (!el || !el.closest) return false;
+    // Other Tampermonkey overlays on the production chart — not our calendar.
+    return !!el.closest('[data-tm-grid], [data-tmsb], [data-tmsn], [data-tm2-row]');
+  }
+
+  function relevantMutations(records) {
+    for (let i = 0; i < records.length; i++) {
+      const rec = records[i];
+      if (isIgnoredTarget(rec.target)) continue;
+      if (rec.type === 'childList') {
+        const nodes = rec.addedNodes.length + rec.removedNodes.length;
+        if (nodes) {
+          let allIgnored = true;
+          rec.addedNodes.forEach((n) => { if (!isIgnoredTarget(n)) allIgnored = false; });
+          rec.removedNodes.forEach((n) => { if (!isIgnoredTarget(n)) allIgnored = false; });
+          if (allIgnored) continue;
+        }
+      }
+      return true;
+    }
+    return false;
+  }
+
+  new MutationObserver((records) => {
+    if (!relevantMutations(records)) return;
+    schedule();
+  }).observe(document.documentElement, {
     childList: true,
     subtree: true,
     attributes: true,
-    attributeFilter: ['class', 'style', 'title', 'aria-label'],
+    // Not `style`: the clock mole updates it continuously.
+    attributeFilter: ['class', 'title', 'aria-label'],
   });
 
   let tries = 0;
   const poll = setInterval(() => {
-    schedule();
+    if (setupState === 'pending') boot();
+    else schedule();
     if (++tries > 120 || setupState !== 'pending') clearInterval(poll);
   }, 500);
 
   say('script loaded', location.pathname);
-  window.addEventListener('load', () => schedule());
-  schedule();
+  window.addEventListener('load', () => {
+    if (setupState === 'pending') boot();
+  });
+  boot();
 })();
