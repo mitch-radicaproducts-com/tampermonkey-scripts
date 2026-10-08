@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Mission Control - Schedule Lock Calendar
 // @namespace    radicaproducts.com
-// @version      1.2.3
-// @description  First action is timescale → Custom → 4 weeks (Month view has no Previous week). Then Compact, Hide weekends, Today + Previous week ×2. Holiday names from the Visible Holidays table. Weekend-gray fill on holidays and Fridays. Blue today badge follows the real local date. Hourly reset if the range has drifted. Auto-starts without a 4 Week click; ignores the live clock mole.
+// @version      1.2.4
+// @description  First action is timescale → Custom → 4 weeks (Month view has no Previous week). Then Compact, Hide weekends, Today + Previous week ×2. Holiday names from the Visible Holidays table. Weekend-gray fill on holidays and Fridays. Blue today badge follows the real local date. Hourly reset if the range has drifted. Auto-starts without a 4 Week click; ignores the live clock mole. No development pauses — proceeds as soon as each UI target exists.
 // @author       Mitch
 // @match        https://airtable.com/*
 // @run-at       document-idle
@@ -46,16 +46,17 @@
  * mutations. Boot starts from the script itself. The observer ignores the
  * clock and does not watch `style`. An empty Visible Holidays table is
  * frozen immediately — it must not block taking control.
+ *
+ * No development pauses. Clicks proceed on the next animation frame after
+ * the menu item, dialog field, or range title they need is present.
  * ====================================================================== */
 
 (function () {
   'use strict';
 
-  const VERSION = '1.2.3';
+  const VERSION = '1.2.4';
   const TICK_MS = 60 * 60 * 1000;
   const DAY_WATCH_MS = 60 * 1000;
-  const STEP_MS = 1000;
-  const SETTLE_MS = 2000;
   const CLICK_WAIT_MS = 3000;
   const HIDE_TOOLBAR = true;
   const HIDE_FOOTER = true;
@@ -431,8 +432,11 @@
   /* Menus (Airtable portals these onto document.body)                  */
   /* ------------------------------------------------------------------ */
 
-  function sleep(ms) {
-    return new Promise((r) => setTimeout(r, ms));
+  function yieldTurn() {
+    return new Promise((r) => {
+      if (typeof requestAnimationFrame === 'function') requestAnimationFrame(() => r());
+      else setTimeout(r, 0);
+    });
   }
 
   async function waitFor(fn, ms) {
@@ -441,9 +445,9 @@
     while (Date.now() - t0 < limit) {
       const v = fn();
       if (v) return v;
-      await sleep(50);
+      await yieldTurn();
     }
-    return null;
+    return fn() || null;
   }
 
   function labelled(re) {
@@ -548,7 +552,6 @@
     if (!item) { dismiss(); return false; }
     if (!chosen(item)) tap(item);
     else dismiss();
-    await sleep(STEP_MS);
     return true;
   }
 
@@ -566,12 +569,9 @@
     const btn = buttons.timescale();
     if (!btn) return false;
     tap(btn);
-    await sleep(STEP_MS);
     const custom = await waitFor(() => labelled(/^custom\b/i) || labelled(/custom/i));
     if (custom) {
       tap(custom);
-      say('Custom clicked, waiting 1000ms for the dialog');
-      await sleep(1000);
       const input = await waitFor(() =>
         [...document.querySelectorAll('input')].find((i) => {
           if (!visible(i) || i.closest('[' + HIDE_ATTR + ']')) return false;
@@ -587,13 +587,13 @@
       } else {
         pressEnter(document.activeElement);
       }
-      await sleep(STEP_MS);
+      await waitFor(() => isFourWeekTimescale() || buttons.prevWeek());
       return true;
     }
     const four = labelled(/^4\s*weeks?$/i) || labelled(/4\s*week/i);
     if (four) {
       tap(four);
-      await sleep(STEP_MS);
+      await waitFor(() => isFourWeekTimescale() || buttons.prevWeek());
       return true;
     }
     dismiss();
@@ -610,8 +610,7 @@
     say('setting Custom 4 weeks; now=', timescaleLabel() || '(none)');
     for (let i = 0; i < 4; i++) {
       await setTimescaleCustom4();
-      await sleep(STEP_MS);
-      if (isFourWeekTimescale() || buttons.prevWeek()) {
+      if (await waitFor(() => isFourWeekTimescale() || buttons.prevWeek())) {
         say('timescale ok', timescaleLabel());
         return true;
       }
@@ -628,7 +627,6 @@
     if (!item) { dismiss(); return false; }
     if (!chosen(item)) tap(item);
     else dismiss();
-    await sleep(STEP_MS);
     return true;
   }
 
@@ -640,11 +638,8 @@
     // Timescale first. Month view has no Previous week; every later
     // click depends on Custom 4 weeks being in place.
     await ensureTimescaleCustom4();
-    await sleep(STEP_MS);
     await enableHideWeekends();
-    await sleep(STEP_MS);
     await setHeightCompact();
-    await sleep(STEP_MS);
     dismissHoverChrome();
     say('setup done', 'timescale=' + timescaleLabel());
   }
@@ -929,7 +924,6 @@
       const now = rangeKey();
       return now && now !== before;
     }, CLICK_WAIT_MS);
-    await sleep(STEP_MS);
     return true;
   }
 
@@ -946,7 +940,6 @@
       if (!buttons.prevWeek() || /month/i.test(timescaleLabel())) {
         say('Month (or no Previous week) — setting Custom 4 weeks first');
         await ensureTimescaleCustom4();
-        await sleep(STEP_MS);
       }
       if (!buttons.prevWeek()) {
         say('still no Previous week after timescale; not navigating');
@@ -1014,10 +1007,6 @@
 
   async function waitUntilReady() {
     say('waiting', 'readyState=' + document.readyState);
-    const t0 = Date.now();
-    while (document.readyState !== 'complete' && Date.now() - t0 < 15000) {
-      await sleep(200);
-    }
     const found = await waitFor(isCalendarReady, 90000);
     const root = calendar();
     say(
@@ -1028,7 +1017,6 @@
       'cells=' + (root ? dateCells(root).length : 0),
       'range=' + (rangeTitle() || '(none)')
     );
-    await sleep(SETTLE_MS);
     return !!found;
   }
 
@@ -1059,23 +1047,16 @@
       // not hold the calendar until someone clicks 4 Week.
       tryCommitHolidays();
       await setupOnce();
-      await sleep(STEP_MS);
-      await waitFor(() => buttons.prevWeek(), 15000);
+      await waitFor(() => buttons.prevWeek());
       setupState = 'navigating';
       await favoriteView();
       if (!isFavoriteView()) {
         say('favorite view missed, retrying once');
-        await sleep(STEP_MS);
         await favoriteView();
       }
-      await sleep(STEP_MS);
       if (!HOLIDAYS_FROZEN) {
-        const holidays = await waitFor(() => tryCommitHolidays(), 2500);
-        if (!holidays && holidaysTable()) {
-          commitHolidays(readHolidayRows() || Object.create(null));
-        } else if (!holidays) {
-          say('Visible Holidays table not frozen yet');
-        }
+        if (holidaysTable()) commitHolidays(readHolidayRows() || Object.create(null));
+        else say('Visible Holidays table not frozen yet');
       }
       hideChrome();
       dismissHoverChrome();
@@ -1116,18 +1097,15 @@
     }
   }
 
-  const MIN_GAP = 250;
   let timer = null;
-  let last = 0;
 
   function schedule() {
     if (timer) return;
     timer = setTimeout(() => {
       timer = null;
-      last = Date.now();
       apply();
       if (setupState === 'pending') boot();
-    }, Math.max(80, MIN_GAP - (Date.now() - last)));
+    }, 0);
   }
 
   // The collab clock mole ([aria-label="Clock"], [data-at-clock]) rewrites
